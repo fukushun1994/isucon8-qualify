@@ -24,7 +24,6 @@ import (
 	"github.com/labstack/echo-contrib/session"
 	"github.com/labstack/echo/middleware"
 
-	"github.com/patrickmn/go-cache"
 )
 
 type User struct {
@@ -228,23 +227,9 @@ func getEvents(all bool) ([]*Event, error) {
 	return events, nil
 }
 
-
 func getEvent(eventID, loginUserID int64) (*Event, error) {
 	var event Event
-	cachedEvent, found := eventCache.Get(string(eventID))
-	if found {
-		// キャッシュがある場合
-		event = cachedEvent.(Event)
-		// 自分の席かどうかだけここで計算する
-		for _, rank := range []string{"S", "A", "B", "C"} {
-			for i, sheet := range event.Sheets[rank].Detail {
-				event.Sheets[rank].Detail[i].Mine = sheet.User == loginUserID
-			}
-		}
-		return &event, nil
-	}
-	
-	// キャッシュがない場合
+
 	// 指定されたIDのイベントを取得
 	if err := db.QueryRow("SELECT * FROM events WHERE id = ?", eventID).Scan(&event.ID, &event.Title, &event.PublicFg, &event.ClosedFg, &event.Price); err != nil {
 		return nil, err
@@ -339,7 +324,6 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 		}
 		event.Sheets[sheet.Rank].Detail = append(event.Sheets[sheet.Rank].Detail, sheet)
 	}*/
-	eventCache.Set(string(eventID), event, cache.DefaultExpiration)
 	return &event, nil
 }
 
@@ -385,8 +369,6 @@ func (r *Renderer) Render(w io.Writer, name string, data interface{}, c echo.Con
 
 var db *sql.DB
 
-var eventCache *cache.Cache
-
 func main() {
 	go func() {
 		log.Println(http.ListenAndServe("localhost:6060", nil))
@@ -397,8 +379,6 @@ func main() {
 		os.Getenv("DB_HOST"), os.Getenv("DB_PORT"),
 		os.Getenv("DB_DATABASE"),
 	)
-
-	eventCache = cache.New(2 * time.Minute, 1 * time.Minute)
 
 	var err error
 	db, err = sql.Open("mysql", dsn)
@@ -674,6 +654,7 @@ func main() {
 		var reservationID int64
 		for {
 			tx, err := db.Begin()
+
 			if err != nil {
 				return err
 			}
@@ -702,7 +683,6 @@ func main() {
 				log.Println("re-try: rollback by", err)
 				continue
 			}
-			eventCache.Delete(string(eventID))
 			break
 		}
 		return c.JSON(202, echo.Map{
@@ -723,7 +703,6 @@ func main() {
 		if err != nil {
 			return err
 		}
-
 		event, err := getEvent(eventID, user.ID)
 		if err != nil {
 			if err == sql.ErrNoRows {
@@ -772,8 +751,6 @@ func main() {
 		if err := tx.Commit(); err != nil {
 			return err
 		}
-		eventCache.Delete(string(eventID))
-
 		return c.NoContent(204)
 	}, loginRequired)
 	e.GET("/admin/", func(c echo.Context) error {
@@ -919,7 +896,6 @@ func main() {
 		if err := tx.Commit(); err != nil {
 			return err
 		}
-		eventCache.Delete(string(eventID))
 
 		e, err := getEvent(eventID, -1)
 		if err != nil {
