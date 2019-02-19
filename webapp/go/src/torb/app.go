@@ -89,16 +89,20 @@ type Administrator struct {
 	PassHash  string `json:"pass_hash,omitempty"`
 }
 
-func sessUserID(c echo.Context) int64 {
+func sessUserID(c echo.Context) (int64, string) {
 	sess, _ := session.Get("session", c)
 	var userID int64
+	var nickname string
 	if x, ok := sess.Values["user_id"]; ok {
 		userID, _ = x.(int64)
 	}
-	return userID
+	if x, ok := sess.Values["nickname"]; ok {
+		nickname, _ = x.(string)
+	}
+	return userID, nickname
 }
 
-func sessSetUserID(c echo.Context, id int64) {
+func sessSetUserID(c echo.Context, id int64, nickname string) {
 	sess, _ := session.Get("session", c)
 	sess.Options = &sessions.Options{
 		Path:     "/",
@@ -106,6 +110,7 @@ func sessSetUserID(c echo.Context, id int64) {
 		HttpOnly: true,
 	}
 	sess.Values["user_id"] = id
+	sess.Values["nickname"] = nickname
 	sess.Save(c.Request(), c.Response())
 }
 
@@ -117,19 +122,24 @@ func sessDeleteUserID(c echo.Context) {
 		HttpOnly: true,
 	}
 	delete(sess.Values, "user_id")
+	delete(sess.Values, "nickname")
 	sess.Save(c.Request(), c.Response())
 }
 
-func sessAdministratorID(c echo.Context) int64 {
+func sessAdministratorID(c echo.Context) (int64, string) {
 	sess, _ := session.Get("session", c)
 	var administratorID int64
+	var administratorNickname string
 	if x, ok := sess.Values["administrator_id"]; ok {
 		administratorID, _ = x.(int64)
 	}
-	return administratorID
+	if x, ok := sess.Values["administrator_nickname"]; ok {
+		administratorNickname, _ = x.(string)
+	}
+	return administratorID, administratorNickname
 }
 
-func sessSetAdministratorID(c echo.Context, id int64) {
+func sessSetAdministratorID(c echo.Context, id int64, nickname string) {
 	sess, _ := session.Get("session", c)
 	sess.Options = &sessions.Options{
 		Path:     "/",
@@ -137,6 +147,7 @@ func sessSetAdministratorID(c echo.Context, id int64) {
 		HttpOnly: true,
 	}
 	sess.Values["administrator_id"] = id
+	sess.Values["administrator_nickname"] = nickname
 	sess.Save(c.Request(), c.Response())
 }
 
@@ -148,6 +159,7 @@ func sessDeleteAdministratorID(c echo.Context) {
 		HttpOnly: true,
 	}
 	delete(sess.Values, "administrator_id")
+	delete(sess.Values, "administrator_nickname")
 	sess.Save(c.Request(), c.Response())
 }
 
@@ -170,23 +182,19 @@ func adminLoginRequired(next echo.HandlerFunc) echo.HandlerFunc {
 }
 
 func getLoginUser(c echo.Context) (*User, error) {
-	userID := sessUserID(c)
+	userID, nickname := sessUserID(c)
 	if userID == 0 {
 		return nil, errors.New("not logged in")
 	}
-	var user User
-	err := db.QueryRow("SELECT id, nickname FROM users WHERE id = ?", userID).Scan(&user.ID, &user.Nickname)
-	return &user, err
+	return &User{ID: userID, Nickname: nickname}, nil
 }
 
 func getLoginAdministrator(c echo.Context) (*Administrator, error) {
-	administratorID := sessAdministratorID(c)
+	administratorID, administratorNickname := sessAdministratorID(c)
 	if administratorID == 0 {
 		return nil, errors.New("not logged in")
 	}
-	var administrator Administrator
-	err := db.QueryRow("SELECT id, nickname FROM administrators WHERE id = ?", administratorID).Scan(&administrator.ID, &administrator.Nickname)
-	return &administrator, err
+	return &Administrator{ID: administratorID, Nickname: administratorNickname}, nil
 }
 
 func getEvents(all bool) ([]*Event, error) {
@@ -612,7 +620,7 @@ func main() {
 		c.Bind(&params)
 
 		user := new(User)
-		if err := db.QueryRow("SELECT * FROM users WHERE login_name = ?", params.LoginName).Scan(&user.ID, &user.LoginName, &user.Nickname, &user.PassHash); err != nil {
+		if err := db.QueryRow("SELECT * FROM users WHERE login_name = ?", params.LoginName).Scan(&user.ID, &user.Nickname, &user.LoginName, &user.PassHash); err != nil {
 			if err == sql.ErrNoRows {
 				return resError(c, "authentication_failed", 401)
 			}
@@ -627,7 +635,7 @@ func main() {
 			return resError(c, "authentication_failed", 401)
 		}
 
-		sessSetUserID(c, user.ID)
+		sessSetUserID(c, user.ID, user.Nickname)
 		user, err = getLoginUser(c)
 		if err != nil {
 			return err
@@ -831,7 +839,7 @@ func main() {
 		c.Bind(&params)
 
 		administrator := new(Administrator)
-		if err := db.QueryRow("SELECT * FROM administrators WHERE login_name = ?", params.LoginName).Scan(&administrator.ID, &administrator.LoginName, &administrator.Nickname, &administrator.PassHash); err != nil {
+		if err := db.QueryRow("SELECT * FROM administrators WHERE login_name = ?", params.LoginName).Scan(&administrator.ID, &administrator.Nickname, &administrator.LoginName, &administrator.PassHash); err != nil {
 			if err == sql.ErrNoRows {
 				return resError(c, "authentication_failed", 401)
 			}
@@ -846,7 +854,7 @@ func main() {
 			return resError(c, "authentication_failed", 401)
 		}
 
-		sessSetAdministratorID(c, administrator.ID)
+		sessSetAdministratorID(c, administrator.ID, administrator.Nickname)
 		administrator, err = getLoginAdministrator(c)
 		if err != nil {
 			return err
