@@ -727,13 +727,13 @@ func main() {
 		if err != nil {
 			return err
 		}
-		event, err := getEvent(eventID, user.ID)
-		if err != nil {
+		var isPublic bool
+		if err := db.QueryRow("SELECT public_fg FROM events WHERE id = ?", eventID).Scan(&isPublic); err != nil {
 			if err == sql.ErrNoRows {
 				return resError(c, "invalid_event", 404)
 			}
 			return err
-		} else if !event.PublicFg {
+		} else if !isPublic {
 			return resError(c, "invalid_event", 404)
 		}
 
@@ -755,7 +755,7 @@ func main() {
 		}
 
 		var reservation Reservation
-		if err := tx.QueryRow("SELECT id, event_id, sheet_id, user_id, reserved_at, canceled_at FROM reservations WHERE event_id = ? AND sheet_id = ? AND canceled_at IS NULL FOR UPDATE", event.ID, sheet.ID).Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt); err != nil {
+		if err := tx.QueryRow("SELECT id, event_id, sheet_id, user_id, reserved_at, canceled_at FROM reservations WHERE event_id = ? AND sheet_id = ? AND canceled_at IS NULL FOR UPDATE", eventID, sheet.ID).Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt); err != nil {
 			tx.Rollback()
 			if err == sql.ErrNoRows {
 				return resError(c, "not_reserved", 400)
