@@ -24,6 +24,7 @@ import (
 	"github.com/labstack/echo-contrib/session"
 	"github.com/labstack/echo/middleware"
 
+	"sync"
 )
 
 type User struct {
@@ -258,8 +259,21 @@ func getSheetInfo() (map[string]int, map[string]int64, error) {
 }
 
 func getEvent(eventID, loginUserID int64) (*Event, error) {
-	var event Event
+	eventCache.mux.Lock()
+	defer eventCache.mux.Unlock()
+	if x, ok := eventCache.values[eventID]; ok {
+		// キャッシュがある場合
+		// 自分の予約かだけここで計算する
+		for _, rank := range []string{"S", "A", "B", "C"} {
+			for _, sheet := range x.Sheets[rank].Detail {
+				sheet.Mine = sheet.User == loginUserID
+			}
+		}
+		return &x, nil
+	}
 
+	// キャッシュがない場合
+	var event Event
 	// 指定されたIDのイベントを取得
 	if err := db.QueryRow("SELECT * FROM events WHERE id = ?", eventID).Scan(&event.ID, &event.Title, &event.PublicFg, &event.ClosedFg, &event.Price); err != nil {
 		return nil, err
@@ -288,7 +302,6 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 		rows.Scan(&rank, &price)
 		sheetPrice[rank] = price;
 	}
-
 	// 座席ごとの状況を取得
 	rows, err = db.Query("SELECT s.id, s.rank, s.num, r.user_id, r.reserved_at FROM sheets AS s LEFT OUTER JOIN reservations AS r ON s.id = r.sheet_id AND r.event_id = ? AND NOT r.is_canceled", eventID)
 
@@ -314,6 +327,9 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 		}
 		event.Sheets[sheet.Rank].Detail = append(event.Sheets[sheet.Rank].Detail, sheet)
 	}
+	// キャッシュに保存
+	eventCache.values[eventID] = event
+
 	return &event, nil
 }
 
@@ -359,6 +375,13 @@ func (r *Renderer) Render(w io.Writer, name string, data interface{}, c echo.Con
 
 var db *sql.DB
 
+type EventCache struct {
+	values map[int64]Event
+	mux sync.Mutex
+}
+
+var eventCache EventCache
+
 func main() {
 	go func() {
 		log.Println(http.ListenAndServe("localhost:6060", nil))
@@ -369,6 +392,8 @@ func main() {
 		os.Getenv("DB_HOST"), os.Getenv("DB_PORT"),
 		os.Getenv("DB_DATABASE"),
 	)
+
+	eventCache.values = make(map[int64]Event)
 
 	var err error
 	db, err = sql.Open("mysql", dsn)
@@ -646,6 +671,8 @@ func main() {
 		return c.JSON(200, sanitizeEvent(event))
 	})
 	e.POST("/api/events/:id/actions/reserve", func(c echo.Context) error {
+		eventCache.mux.Lock()
+		defer eventCache.mux.Unlock()
 		eventID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 		if err != nil {
 			return resError(c, "not_found", 404)
@@ -683,7 +710,7 @@ func main() {
 				return err
 			}
 
-			if err := db.QueryRow("SELECT * FROM sheets WHERE id NOT IN (SELECT sheet_id FROM reservations WHERE event_id = ? AND canceled_at IS NULL FOR UPDATE) AND `rank` = ? ORDER BY RAND() LIMIT 1", eventID, params.Rank).Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
+			if err := tx.QueryRow("SELECT * FROM sheets WHERE id NOT IN (SELECT sheet_id FROM reservations WHERE event_id = ? AND canceled_at IS NULL FOR UPDATE) AND `rank` = ? ORDER BY RAND() LIMIT 1", eventID, params.Rank).Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
 				if err == sql.ErrNoRows {
 					return resError(c, "sold_out", 409)
 				}
@@ -709,6 +736,7 @@ func main() {
 			}
 			break
 		}
+		delete(eventCache.values, eventID)
 		return c.JSON(202, echo.Map{
 			"id":         reservationID,
 			"sheet_rank": params.Rank,
@@ -716,6 +744,8 @@ func main() {
 		})
 	}, loginRequired)
 	e.DELETE("/api/events/:id/sheets/:rank/:num/reservation", func(c echo.Context) error {
+		eventCache.mux.Lock()
+		defer eventCache.mux.Unlock()
 		eventID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 		if err != nil {
 			return resError(c, "not_found", 404)
@@ -775,6 +805,7 @@ func main() {
 		if err := tx.Commit(); err != nil {
 			return err
 		}
+		delete(eventCache.values, eventID)
 		return c.NoContent(204)
 	}, loginRequired)
 	e.GET("/admin/", func(c echo.Context) error {
@@ -841,6 +872,7 @@ func main() {
 		}
 		c.Bind(&params)
 
+		eventCache.mux.Lock()
 		tx, err := db.Begin()
 		if err != nil {
 			return err
@@ -859,11 +891,12 @@ func main() {
 		if err := tx.Commit(); err != nil {
 			return err
 		}
-
+		eventCache.mux.Unlock()
 		event, err := getEvent(eventID, -1)
 		if err != nil {
 			return err
 		}
+		delete(eventCache.values, eventID)
 		return c.JSON(200, event)
 	}, adminLoginRequired)
 	e.GET("/admin/api/events/:id", func(c echo.Context) error {
@@ -909,6 +942,7 @@ func main() {
 			return resError(c, "cannot_close_public_event", 400)
 		}
 
+		eventCache.mux.Lock()
 		tx, err := db.Begin()
 		if err != nil {
 			return err
@@ -920,12 +954,12 @@ func main() {
 		if err := tx.Commit(); err != nil {
 			return err
 		}
+		event.PublicFg = params.Public
+		event.ClosedFg = params.Closed
+		delete(eventCache.values, eventID)
+		eventCache.mux.Unlock()
 
-		e, err := getEvent(eventID, -1)
-		if err != nil {
-			return err
-		}
-		c.JSON(200, e)
+		c.JSON(200, event)
 		return nil
 	}, adminLoginRequired)
 	e.GET("/admin/api/reports/events/:id/sales", func(c echo.Context) error {
