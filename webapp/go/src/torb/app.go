@@ -227,6 +227,36 @@ func getEvents(all bool) ([]*Event, error) {
 	return events, nil
 }
 
+// ランクごとのシート数と料金を返す
+func getSheetInfo() (map[string]int, map[string]int64, error) {
+	var sheetTotal map[string]int = map[string]int {
+		"S": 0,
+		"A": 0,
+		"B": 0,
+		"C": 0,
+	}
+	var sheetPrice map[string]int64 = map[string]int64 {
+		"S": 0,
+		"A": 0,
+		"B": 0,
+		"C": 0,
+	}
+	rows, err := db.Query("SELECT `rank`, COUNT(*), price FROM sheets GROUP BY `rank`")
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var rank string
+		var total int
+		var price int64
+		rows.Scan(&rank, &total, &price)
+		sheetTotal[rank] = total
+		sheetPrice[rank] = price
+	}
+	return sheetTotal, sheetPrice, nil
+}
+
 func getEvent(eventID, loginUserID int64) (*Event, error) {
 	var event Event
 
@@ -630,13 +660,13 @@ func main() {
 			return err
 		}
 
-		event, err := getEvent(eventID, user.ID)
-		if err != nil {
+		var isPublic bool
+		if err := db.QueryRow("SELECT public_fg FROM events WHERE id = ?", eventID).Scan(&isPublic); err != nil {
 			if err == sql.ErrNoRows {
 				return resError(c, "invalid_event", 404)
 			}
 			return err
-		} else if !event.PublicFg {
+		} else if !isPublic {
 			return resError(c, "invalid_event", 404)
 		}
 
@@ -653,14 +683,14 @@ func main() {
 				return err
 			}
 
-			if err := db.QueryRow("SELECT * FROM sheets WHERE id NOT IN (SELECT sheet_id FROM reservations WHERE event_id = ? AND canceled_at IS NULL FOR UPDATE) AND `rank` = ? ORDER BY RAND() LIMIT 1", event.ID, params.Rank).Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
+			if err := db.QueryRow("SELECT * FROM sheets WHERE id NOT IN (SELECT sheet_id FROM reservations WHERE event_id = ? AND canceled_at IS NULL FOR UPDATE) AND `rank` = ? ORDER BY RAND() LIMIT 1", eventID, params.Rank).Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
 				if err == sql.ErrNoRows {
 					return resError(c, "sold_out", 409)
 				}
 				return err
 			}
 
-			res, err := tx.Exec("INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?)", event.ID, sheet.ID, user.ID, time.Now().UTC().Format("2006-01-02 15:04:05.000000"))
+			res, err := tx.Exec("INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?)", eventID, sheet.ID, user.ID, time.Now().UTC().Format("2006-01-02 15:04:05.000000"))
 			if err != nil {
 				tx.Rollback()
 				log.Println("re-try: rollback by", err)
