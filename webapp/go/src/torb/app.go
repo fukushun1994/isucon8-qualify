@@ -312,6 +312,7 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 	}
 	var userID sql.NullInt64
 	var reservedAt *time.Time
+	var remains [4]int
 	for rows.Next() {
 		var sheet Sheet
 		if err := rows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &userID, &reservedAt); err != nil {
@@ -323,10 +324,13 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 			sheet.Reserved = true
 			sheet.ReservedAtUnix = reservedAt.Unix()
 		} else {
-			event.Remains++
-			event.Sheets[sheet.Rank].Remains++
+			remains[rankToNum(sheet.Rank)]++
 		}
 		event.Sheets[sheet.Rank].Detail[sheet.Num-1] = &sheet
+	}
+	for i, rank := range []string{ "S", "A", "B", "C"} {
+			event.Remains += remains[i]
+			event.Sheets[rank].Remains = remains[i]
 	}
 	// キャッシュに保存
 	ec.event = event
