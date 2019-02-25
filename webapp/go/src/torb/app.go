@@ -267,20 +267,30 @@ func getSheetInfo() (map[string]int, map[string]int64, error) {
 }
 
 func getEvent(eventID, loginUserID int64) (*Event, error) {
-	eventCache.mux.Lock()
-	defer eventCache.mux.Unlock()
-	if x, ok := eventCache.values[eventID]; ok {
+	ec, cacheFound := eventCache[eventID]
+	if cacheFound && ec.valid {
 		// キャッシュがある場合
-		// 自分の予約かだけここで計算する
+		ec.mux.Lock()
+		defer ec.mux.Unlock()
 		for _, rank := range []string{"S", "A", "B", "C"} {
-			for _, sheet := range x.Sheets[rank].Detail {
+			for _, sheet := range ec.event.Sheets[rank].Detail {
 				sheet.Mine = sheet.User == loginUserID
 			}
 		}
-		return &x, nil
+		return &ec.event, nil
 	}
 
-	// キャッシュがない場合
+	// キャッシュのオブジェクト自体がない場合は新規に作成
+	eventUpdateMux.Lock()
+	defer eventUpdateMux.Unlock()
+	if !cacheFound {
+		eventCache[eventID] = new(EventCache)
+	}
+
+	ec, cacheFound = eventCache[eventID]
+	ec.mux.Lock()
+	defer ec.mux.Unlock()
+
 	var event Event
 	// 指定されたIDのイベントを取得
 	if err := db.QueryRow("SELECT * FROM events WHERE id = ?", eventID).Scan(&event.ID, &event.Title, &event.PublicFg, &event.ClosedFg, &event.Price); err != nil {
@@ -336,7 +346,8 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 		event.Sheets[sheet.Rank].Detail = append(event.Sheets[sheet.Rank].Detail, sheet)
 	}
 	// キャッシュに保存
-	eventCache.values[eventID] = event
+	ec.event = event
+	ec.valid = true
 
 	return &event, nil
 }
@@ -384,11 +395,13 @@ func (r *Renderer) Render(w io.Writer, name string, data interface{}, c echo.Con
 var db *sql.DB
 
 type EventCache struct {
-	values map[int64]Event
+	event Event
 	mux sync.Mutex
+	valid bool	// eventが有効なキャッシュかどうか
 }
 
-var eventCache EventCache
+var eventCache map[int64]*EventCache
+var eventUpdateMux sync.Mutex
 
 func main() {
 	go func() {
@@ -401,7 +414,7 @@ func main() {
 		os.Getenv("DB_DATABASE"),
 	)
 
-	eventCache.values = make(map[int64]Event)
+	eventCache = make(map[int64]*EventCache)
 
 	var err error
 	db, err = sql.Open("mysql", dsn)
@@ -679,8 +692,6 @@ func main() {
 		return c.JSON(200, sanitizeEvent(event))
 	})
 	e.POST("/api/events/:id/actions/reserve", func(c echo.Context) error {
-		eventCache.mux.Lock()
-		defer eventCache.mux.Unlock()
 		eventID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 		if err != nil {
 			return resError(c, "not_found", 404)
@@ -689,6 +700,12 @@ func main() {
 			Rank string `json:"sheet_rank"`
 		}
 		c.Bind(&params)
+
+		ec, cacheFound := eventCache[eventID]
+		if cacheFound {
+			ec.mux.Lock()
+			defer ec.mux.Unlock()
+		}
 
 		user, err := getLoginUser(c)
 		if err != nil {
@@ -744,7 +761,9 @@ func main() {
 			}
 			break
 		}
-		delete(eventCache.values, eventID)
+		if cacheFound {
+			ec.valid = false
+		}
 		return c.JSON(202, echo.Map{
 			"id":         reservationID,
 			"sheet_rank": params.Rank,
@@ -752,14 +771,18 @@ func main() {
 		})
 	}, loginRequired)
 	e.DELETE("/api/events/:id/sheets/:rank/:num/reservation", func(c echo.Context) error {
-		eventCache.mux.Lock()
-		defer eventCache.mux.Unlock()
 		eventID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 		if err != nil {
 			return resError(c, "not_found", 404)
 		}
 		rank := c.Param("rank")
 		num := c.Param("num")
+
+		ec, cacheFound := eventCache[eventID]
+		if cacheFound {
+			ec.mux.Lock()
+			defer ec.mux.Unlock()
+		}
 
 		user, err := getLoginUser(c)
 		if err != nil {
@@ -813,7 +836,9 @@ func main() {
 		if err := tx.Commit(); err != nil {
 			return err
 		}
-		delete(eventCache.values, eventID)
+		if cacheFound {
+			ec.valid = false
+		}
 		return c.NoContent(204)
 	}, loginRequired)
 	e.GET("/admin/", func(c echo.Context) error {
@@ -880,7 +905,7 @@ func main() {
 		}
 		c.Bind(&params)
 
-		eventCache.mux.Lock()
+		eventUpdateMux.Lock()
 		tx, err := db.Begin()
 		if err != nil {
 			return err
@@ -899,12 +924,13 @@ func main() {
 		if err := tx.Commit(); err != nil {
 			return err
 		}
-		eventCache.mux.Unlock()
+		eventCache[eventID] = new(EventCache)
+		eventUpdateMux.Unlock()
+
 		event, err := getEvent(eventID, -1)
 		if err != nil {
 			return err
 		}
-		delete(eventCache.values, eventID)
 		return c.JSON(200, event)
 	}, adminLoginRequired)
 	e.GET("/admin/api/events/:id", func(c echo.Context) error {
@@ -932,6 +958,7 @@ func main() {
 			Closed bool `json:"closed"`
 		}
 		c.Bind(&params)
+
 		if params.Closed {
 			params.Public = false
 		}
@@ -950,7 +977,12 @@ func main() {
 			return resError(c, "cannot_close_public_event", 400)
 		}
 
-		eventCache.mux.Lock()
+		ec, cacheFound := eventCache[eventID]
+		if cacheFound {
+			ec.mux.Lock()
+			defer ec.mux.Unlock()
+		}
+		
 		tx, err := db.Begin()
 		if err != nil {
 			return err
@@ -964,8 +996,9 @@ func main() {
 		}
 		event.PublicFg = params.Public
 		event.ClosedFg = params.Closed
-		delete(eventCache.values, eventID)
-		eventCache.mux.Unlock()
+		if cacheFound {
+			ec.valid = false
+		}
 
 		c.JSON(200, event)
 		return nil
