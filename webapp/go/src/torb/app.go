@@ -198,7 +198,7 @@ func getLoginAdministrator(c echo.Context) (*Administrator, error) {
 }
 
 func getEvents(all bool) ([]*Event, error) {
-	rows, err := db.Query("SELECT * FROM events ORDER BY id ASC")
+	rows, err := db.Query("SELECT id, public_fg FROM events ORDER BY id ASC")
 	if err != nil {
 		return nil, err
 	}
@@ -206,26 +206,19 @@ func getEvents(all bool) ([]*Event, error) {
 
 	var events []*Event
 	for rows.Next() {
-		var event Event
-		if err := rows.Scan(&event.ID, &event.Title, &event.PublicFg, &event.ClosedFg, &event.Price); err != nil {
+		var eventID int64
+		var isPublic bool
+		if err := rows.Scan(&eventID, &isPublic); err != nil {
 			return nil, err
 		}
-		if !all && !event.PublicFg {
+		if !all && !isPublic {
 			continue
 		}
-		events = append(events, &event)
-	}
-	for i, v := range events {
-		event, err := getEvent(v.ID, -1)
+		event, err := getEvent(event.ID, -1)
 		if err != nil {
 			return nil, err
 		}
-		/*
-		for k := range event.Sheets {
-			event.Sheets[k].Detail = nil
-		}
-		*/
-		events[i] = event
+		events = append(events, event)
 	}
 	return events, nil
 }
@@ -999,12 +992,7 @@ func main() {
 			return resError(c, "not_found", 404)
 		}
 
-		event, err := getEvent(eventID, -1)
-		if err != nil {
-			return err
-		}
-
-		rows, err := db.Query("SELECT r.id, r.event_id, r.sheet_id, r.user_id, r.reserved_at, r.canceled_at, s.rank AS sheet_rank, s.num AS sheet_num, s.price AS sheet_price, e.price AS event_price FROM reservations r INNER JOIN sheets s ON s.id = r.sheet_id INNER JOIN events e ON e.id = r.event_id WHERE r.event_id = ?", event.ID)
+		rows, err := db.Query("SELECT r.id, r.event_id, r.sheet_id, r.user_id, r.reserved_at, r.canceled_at, s.rank AS sheet_rank, s.num AS sheet_num, s.price AS sheet_price, e.price AS event_price FROM reservations r INNER JOIN sheets s ON s.id = r.sheet_id INNER JOIN events e ON e.id = r.event_id WHERE r.event_id = ?", eventID)
 		if err != nil {
 			return err
 		}
@@ -1014,12 +1002,13 @@ func main() {
 		for rows.Next() {
 			var reservation Reservation
 			var sheet Sheet
+			var event Event
 			if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &sheet.Rank, &sheet.Num, &sheet.Price, &event.Price); err != nil {
 				return err
 			}
 			report := Report{
 				ReservationID: reservation.ID,
-				EventID:       event.ID,
+				EventID:       eventID,
 				Rank:          sheet.Rank,
 				Num:           sheet.Num,
 				UserID:        reservation.UserID,
@@ -1057,9 +1046,6 @@ func main() {
 				SoldAt:        reservation.ReservedAt,
 				CanceledAt:    reservation.CanceledAt,
 				Price:         event.Price + sheet.Price,
-			}
-			if reservation.CanceledAt != nil {
-				report.CanceledAt = reservation.CanceledAt
 			}
 			reports = append(reports, report)
 		}
