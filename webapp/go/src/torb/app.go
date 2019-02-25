@@ -302,27 +302,12 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 		"B": &Sheets{},
 		"C": &Sheets{},
 	}
-	// 先にシートの価格だけ取得する
-	var sheetPrice map[string]int64 = map[string]int64{
-		"S": 0,
-		"A": 0,
-		"B": 0,
-		"C": 0,
-	}
-	rows, err := db.Query("SELECT * FROM sheet_ranks")
+	
+	// 座席ごとの状況を取得
+	rows, err := db.Query("SELECT s.id, s.rank, s.num, r.user_id, r.reserved_at FROM sheets AS s LEFT OUTER JOIN reservations AS r ON s.id = r.sheet_id AND r.event_id = ? AND NOT r.is_canceled", eventID)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var rank string
-		var price int64
-		rows.Scan(&rank, &price)
-		sheetPrice[rank] = price;
-	}
-	// 座席ごとの状況を取得
-	rows, err = db.Query("SELECT s.id, s.rank, s.num, r.user_id, r.reserved_at FROM sheets AS s LEFT OUTER JOIN reservations AS r ON s.id = r.sheet_id AND r.event_id = ? AND NOT r.is_canceled", eventID)
-
 	for rows.Next() {
 		var sheet Sheet
 		var userID sql.NullInt64
@@ -330,7 +315,7 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 		if err := rows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &userID, &reservedAt); err != nil {
 			return nil, err
 		}
-		event.Sheets[sheet.Rank].Price = event.Price + sheetPrice[sheet.Rank]
+		event.Sheets[sheet.Rank].Price = event.Price + sheetInfo.price[sheet.Rank]
 		event.Total++
 		event.Sheets[sheet.Rank].Total++
 
@@ -400,8 +385,14 @@ type EventCache struct {
 	valid bool	// eventが有効なキャッシュかどうか
 }
 
+type SheetInfo struct {
+	total map[string]int
+	price map[string]int64
+}
+
 var eventCache map[int64]*EventCache
 var eventUpdateMux sync.Mutex
+var sheetInfo SheetInfo
 
 func main() {
 	go func() {
@@ -421,6 +412,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	// 座席の静的な情報は最初に取得
+	sheetInfo.total, sheetInfo.price, _ = getSheetInfo()
 
 	e := echo.New()
 	funcs := template.FuncMap{
@@ -515,11 +509,6 @@ func main() {
 		if user.ID != loginUser.ID {
 			return resError(c, "forbidden", 403)
 		}
-		// シート情報取得
-		sheetTotal, sheetPrice, err := getSheetInfo()
-		if err != nil {
-			return err
-		}
 		// 先に、直近に予約・キャンセルした予約一覧を取得
 		rows, err := db.Query("SELECT e.* FROM events AS e INNER JOIN reservations AS r ON r.user_id = ? AND e.id = r.event_id GROUP BY event_id ORDER BY MAX(IFNULL(canceled_at, reserved_at)) DESC LIMIT 5", user.ID)
 		if err != nil {
@@ -546,11 +535,11 @@ func main() {
 				"B": &Sheets{},
 				"C": &Sheets{},
 			}
-			for rank, _ := range sheetTotal {
-				total := sheetTotal[rank]
+			for rank, _ := range sheetInfo.total {
+				total := sheetInfo.total[rank]
 				v.Sheets[rank].Total = total
 				v.Sheets[rank].Remains = total	// あとで引いていくので初期値は総数とする
-				v.Sheets[rank].Price = sheetPrice[rank] + v.Price
+				v.Sheets[rank].Price = sheetInfo.price[rank] + v.Price
 				v.Total += total
 			}
 			v.Remains = v.Total
