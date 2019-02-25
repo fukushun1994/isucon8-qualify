@@ -269,7 +269,7 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 				sheet.Mine = sheet.User == loginUserID
 			}
 		}
-		return &ec.event, nil
+		return ec.event, nil
 	}
 
 	// キャッシュのオブジェクト自体がない場合は新規に作成
@@ -333,7 +333,7 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 			event.Sheets[rank].Remains = remains[i]
 	}
 	// キャッシュに保存
-	ec.event = event
+	ec.event = &event
 	ec.valid = true
 
 	return &event, nil
@@ -380,7 +380,7 @@ func (r *Renderer) Render(w io.Writer, name string, data interface{}, c echo.Con
 var db *sql.DB
 
 type EventCache struct {
-	event Event
+	event *Event
 	mux sync.Mutex
 	valid bool	// eventが有効なキャッシュかどうか
 }
@@ -1006,18 +1006,18 @@ func main() {
 			return resError(c, "not_found", 404)
 		}
 
-		rows, err := db.Query("SELECT r.id, r.event_id, r.sheet_id, r.user_id, r.reserved_at, r.canceled_at, s.rank AS sheet_rank, s.num AS sheet_num, s.price AS sheet_price, e.price AS event_price FROM reservations r INNER JOIN sheets s ON s.id = r.sheet_id INNER JOIN events e ON e.id = r.event_id WHERE r.event_id = ?", eventID)
+		rows, err := db.Query("SELECT r.id, r.user_id, r.reserved_at, r.canceled_at, s.rank AS sheet_rank, s.num AS sheet_num, s.price AS sheet_price, e.price AS event_price FROM reservations r INNER JOIN sheets s ON s.id = r.sheet_id INNER JOIN events e ON e.id = r.event_id WHERE r.event_id = ?", eventID)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
 
 		var reports []Report
+		var reservation Reservation
+		var sheet Sheet
+		var event Event
 		for rows.Next() {
-			var reservation Reservation
-			var sheet Sheet
-			var event Event
-			if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &sheet.Rank, &sheet.Num, &sheet.Price, &event.Price); err != nil {
+			if err := rows.Scan(&reservation.ID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &sheet.Rank, &sheet.Num, &sheet.Price, &event.Price); err != nil {
 				return err
 			}
 			report := Report{
@@ -1037,18 +1037,18 @@ func main() {
 		return renderReportCSV(c, reports)
 	}, adminLoginRequired)
 	e.GET("/admin/api/reports/sales", func(c echo.Context) error {
-		rows, err := db.Query("select r.id, r.event_id, r.sheet_id, r.user_id, r.reserved_at, r.canceled_at, s.rank as sheet_rank, s.num as sheet_num, s.price as sheet_price, e.id as event_id, e.price as event_price from reservations r inner join sheets s on s.id = r.sheet_id inner join events e on e.id = r.event_id")
+		rows, err := db.Query("select r.id, r.user_id, r.reserved_at, r.canceled_at, s.rank, s.num, s.price, e.id, e.price from reservations r inner join sheets s on s.id = r.sheet_id inner join events e on e.id = r.event_id")
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
 
 		var reports []Report
+		var reservation Reservation
+		var sheet Sheet
+		var event Event
 		for rows.Next() {
-			var reservation Reservation
-			var sheet Sheet
-			var event Event
-			if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &sheet.Rank, &sheet.Num, &sheet.Price, &event.ID, &event.Price); err != nil {
+			if err := rows.Scan(&reservation.ID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &sheet.Rank, &sheet.Num, &sheet.Price, &event.ID, &event.Price); err != nil {
 				return err
 			}
 			report := Report{
