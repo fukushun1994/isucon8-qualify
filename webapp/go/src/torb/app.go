@@ -13,7 +13,6 @@ import (
 	"os/exec"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 	"net/http"
 	_ "net/http/pprof"
@@ -1024,11 +1023,11 @@ func main() {
 				Rank:          sheet.Rank,
 				Num:           sheet.Num,
 				UserID:        reservation.UserID,
-				SoldAt:        reservation.ReservedAt.Format("2006-01-02T15:04:05.000000Z"),
+				SoldAt:        reservation.ReservedAt,
 				Price:         event.Price + sheet.Price,
 			}
 			if reservation.CanceledAt != nil {
-				report.CanceledAt = reservation.CanceledAt.Format("2006-01-02T15:04:05.000000Z")
+				report.CanceledAt = reservation.CanceledAt
 			}
 			reports = append(reports, report)
 		}
@@ -1055,11 +1054,12 @@ func main() {
 				Rank:          sheet.Rank,
 				Num:           sheet.Num,
 				UserID:        reservation.UserID,
-				SoldAt:        reservation.ReservedAt.Format("2006-01-02T15:04:05.000000Z"),
+				SoldAt:        reservation.ReservedAt,
+				CanceledAt:    reservation.CanceledAt,
 				Price:         event.Price + sheet.Price,
 			}
 			if reservation.CanceledAt != nil {
-				report.CanceledAt = reservation.CanceledAt.Format("2006-01-02T15:04:05.000000Z")
+				report.CanceledAt = reservation.CanceledAt
 			}
 			reports = append(reports, report)
 		}
@@ -1075,18 +1075,22 @@ type Report struct {
 	Rank          string
 	Num           int64
 	UserID        int64
-	SoldAt        string
-	CanceledAt    string
+	SoldAt        *time.Time
+	CanceledAt    *time.Time
 	Price         int64
 }
 
 func renderReportCSV(c echo.Context, reports []Report) error {
-	sort.Slice(reports, func(i, j int) bool { return strings.Compare(reports[i].SoldAt, reports[j].SoldAt) < 0 })
+	sort.Slice(reports, func(i, j int) bool { return reports[i].SoldAt.Before(*reports[j].SoldAt) })
 
 	body := bytes.NewBufferString("reservation_id,event_id,rank,num,price,user_id,sold_at,canceled_at\n")
 	for _, v := range reports {
+		var canceledAt string
+		if v.CanceledAt != nil {
+			canceledAt = v.CanceledAt.Format("2006-01-02T15:04:05.000000Z")
+		}
 		body.WriteString(fmt.Sprintf("%d,%d,%s,%d,%d,%d,%s,%s\n",
-			v.ReservationID, v.EventID, v.Rank, v.Num, v.Price, v.UserID, v.SoldAt, v.CanceledAt))
+			v.ReservationID, v.EventID, v.Rank, v.Num, v.Price, v.UserID, v.SoldAt.Format("2006-01-02T15:04:05.000000Z"), canceledAt))
 	}
 
 	c.Response().Header().Set("Content-Type", `text/csv; charset=UTF-8`)
