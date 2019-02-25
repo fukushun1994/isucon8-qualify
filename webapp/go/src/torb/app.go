@@ -49,7 +49,7 @@ type Event struct {
 type Sheets struct {
 	Total   int      `json:"total"`
 	Remains int      `json:"remains"`
-	Detail  []Sheet `json:"detail,omitempty"`
+	Detail  []*Sheet `json:"detail,omitempty"`
 	Price   int64    `json:"price"`
 }
 
@@ -214,7 +214,7 @@ func getEvents(all bool) ([]*Event, error) {
 		if !all && !isPublic {
 			continue
 		}
-		event, err := getEvent(event.ID, -1)
+		event, err := getEvent(eventID, -1)
 		if err != nil {
 			return nil, err
 		}
@@ -223,32 +223,37 @@ func getEvents(all bool) ([]*Event, error) {
 	return events, nil
 }
 
+func rankToNum(rank string) int {
+	switch rank {
+	case "C":
+		return 3
+	case "B":
+		return 2
+	case "A":
+		return 1
+	case "S":
+		return 0
+	}
+	return -1
+}
+
 // ランクごとのシート数と料金を返す
-func getSheetInfo() (map[string]int, map[string]int64, error) {
-	var sheetTotal map[string]int = map[string]int {
-		"S": 0,
-		"A": 0,
-		"B": 0,
-		"C": 0,
-	}
-	var sheetPrice map[string]int64 = map[string]int64 {
-		"S": 0,
-		"A": 0,
-		"B": 0,
-		"C": 0,
-	}
+func getSheetInfo() ([]int, []int64, error) {
+	sheetTotal := []int {0, 0, 0, 0}
+	sheetPrice := []int64 {0, 0, 0, 0}
 	rows, err := db.Query("SELECT `rank`, COUNT(*), price FROM sheets GROUP BY `rank`")
 	if err != nil {
 		return nil, nil, err
 	}
 	defer rows.Close()
+
+	var rank string
+	var total int
+	var price int64
 	for rows.Next() {
-		var rank string
-		var total int
-		var price int64
 		rows.Scan(&rank, &total, &price)
-		sheetTotal[rank] = total
-		sheetPrice[rank] = price
+		sheetTotal[rankToNum(rank)] = total
+		sheetPrice[rankToNum(rank)] = price
 	}
 	return sheetTotal, sheetPrice, nil
 }
@@ -259,7 +264,7 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 		// キャッシュがある場合
 		ec.mux.Lock()
 		defer ec.mux.Unlock()
-		for _, rank := range []string{"S", "A", "B", "C"} {
+		for _, rank := range []string{ "S", "A", "B", "C" } {
 			for _, sheet := range ec.event.Sheets[rank].Detail {
 				sheet.Mine = sheet.User == loginUserID
 			}
@@ -290,23 +295,28 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 		"B": &Sheets{},
 		"C": &Sheets{},
 	}
-	
+
+	// 総席数や価格を先に計算
+	for i, rank := range []string{ "S", "A", "B", "C"} {
+		sheets := event.Sheets[rank]
+		sheets.Total = sheetInfo.total[i]
+		sheets.Detail = make([]*Sheet, sheets.Total)
+		sheets.Price = event.Price + sheetInfo.price[i]
+		event.Total += sheetInfo.total[i]
+	}
+
 	// 座席ごとの状況を取得
 	rows, err := db.Query("SELECT s.id, s.rank, s.num, r.user_id, r.reserved_at FROM sheets AS s LEFT OUTER JOIN reservations AS r ON s.id = r.sheet_id AND r.event_id = ? AND NOT r.is_canceled", eventID)
 	if err != nil {
 		return nil, err
 	}
+	var userID sql.NullInt64
+	var reservedAt *time.Time
 	for rows.Next() {
 		var sheet Sheet
-		var userID sql.NullInt64
-		var reservedAt *time.Time
 		if err := rows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &userID, &reservedAt); err != nil {
 			return nil, err
 		}
-		event.Sheets[sheet.Rank].Price = event.Price + sheetInfo.price[sheet.Rank]
-		event.Total++
-		event.Sheets[sheet.Rank].Total++
-
 		if userID.Valid {
 			sheet.User = userID.Int64
 			sheet.Mine = userID.Int64 == loginUserID
@@ -316,7 +326,7 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 			event.Remains++
 			event.Sheets[sheet.Rank].Remains++
 		}
-		event.Sheets[sheet.Rank].Detail = append(event.Sheets[sheet.Rank].Detail, sheet)
+		event.Sheets[sheet.Rank].Detail[sheet.Num-1] = &sheet
 	}
 	// キャッシュに保存
 	ec.event = event
@@ -352,7 +362,7 @@ func fillinAdministrator(next echo.HandlerFunc) echo.HandlerFunc {
 }
 
 func validateRank(rank string) bool {
-	return rank == "S" || rank == "A" || rank == "B" || rank == "C"
+	return rankToNum(rank) != -1
 }
 
 type Renderer struct {
@@ -372,8 +382,8 @@ type EventCache struct {
 }
 
 type SheetInfo struct {
-	total map[string]int
-	price map[string]int64
+	total []int
+	price []int64
 }
 
 var eventCache map[int64]*EventCache
@@ -521,11 +531,11 @@ func main() {
 				"B": &Sheets{},
 				"C": &Sheets{},
 			}
-			for rank, _ := range sheetInfo.total {
-				total := sheetInfo.total[rank]
+			for i, rank := range []string{"S", "A", "B", "C"} {
+				total := sheetInfo.total[i]
 				v.Sheets[rank].Total = total
 				v.Sheets[rank].Remains = total	// あとで引いていくので初期値は総数とする
-				v.Sheets[rank].Price = sheetInfo.price[rank] + v.Price
+				v.Sheets[rank].Price = sheetInfo.price[i] + v.Price
 				v.Total += total
 			}
 			v.Remains = v.Total
@@ -537,11 +547,11 @@ func main() {
 		}
 		defer rows.Close()
 
+		var eventID int64
+		var rank string
+		var reservedNum int
 		// 予約済みの分を引いていく
 		for rows.Next() {
-			var eventID int64
-			var rank string
-			var reservedNum int
 			rows.Scan(&eventID, &rank, &reservedNum)
 			if eventMap[eventID] == nil {
 				continue
@@ -558,10 +568,13 @@ func main() {
 		}
 		defer rows.Close()
 		var recentReservations []Reservation
+		recentReservations = make([]Reservation, 5)
+		
+		rowNum := 0
 		for rows.Next() {
-			var reservation Reservation
 			var rank string
 			var sheetNum int64
+			reservation := &recentReservations[rowNum]
 			if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &rank, &sheetNum); err != nil {
 				return err
 			}
@@ -579,9 +592,9 @@ func main() {
 			if reservation.CanceledAt != nil {
 				reservation.CanceledAtUnix = reservation.CanceledAt.Unix()
 			}
-			recentReservations = append(recentReservations, reservation)
+			rowNum++
 		}
-		if recentReservations == nil {
+		if rowNum == 0 {
 			recentReservations = make([]Reservation, 0)
 		}
 		// recentReservations 取得完了
@@ -676,10 +689,8 @@ func main() {
 		}
 		c.Bind(&params)
 
-		ec, cacheFound := eventCache[eventID]
-		if cacheFound {
-			ec.mux.Lock()
-			defer ec.mux.Unlock()
+		if !validateRank(params.Rank) {
+			return resError(c, "invalid_rank", 400)
 		}
 
 		user, err := getLoginUser(c)
@@ -687,18 +698,16 @@ func main() {
 			return err
 		}
 
-		var isPublic bool
-		if err := db.QueryRow("SELECT public_fg FROM events WHERE id = ?", eventID).Scan(&isPublic); err != nil {
-			if err == sql.ErrNoRows {
-				return resError(c, "invalid_event", 404)
-			}
-			return err
-		} else if !isPublic {
+		ec, cacheFound := eventCache[eventID]
+		if cacheFound {
+			ec.mux.Lock()
+			defer ec.mux.Unlock()
+		} else {
 			return resError(c, "invalid_event", 404)
 		}
 
-		if !validateRank(params.Rank) {
-			return resError(c, "invalid_rank", 400)
+		if !ec.event.PublicFg {
+			return resError(c, "invalid_event", 404)
 		}
 
 		var reservationID int64
@@ -716,8 +725,9 @@ func main() {
 			return err
 		}
 
-		availableIDs  := make([]int64, 0, sheetInfo.total[params.Rank])
-		availableNums  := make([]int64, 0, sheetInfo.total[params.Rank])
+		rankNum := rankToNum(params.Rank)
+		availableIDs  := make([]int64, 0, sheetInfo.total[rankNum])
+		availableNums  := make([]int64, 0, sheetInfo.total[rankNum])
 		for rows.Next() {
 			var id int64
 			var num int64
