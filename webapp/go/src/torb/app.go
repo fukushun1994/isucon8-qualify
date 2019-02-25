@@ -364,9 +364,7 @@ func fillinAdministrator(next echo.HandlerFunc) echo.HandlerFunc {
 }
 
 func validateRank(rank string) bool {
-	var count int
-	db.QueryRow("SELECT COUNT(*) FROM sheets WHERE `rank` = ?", rank).Scan(&count)
-	return count > 0
+	return rank == "S" || rank == "A" || rank == "B" || rank == "C"
 }
 
 type Renderer struct {
@@ -724,7 +722,7 @@ func main() {
 				return err
 			}
 
-			if err := tx.QueryRow("SELECT * FROM sheets WHERE id NOT IN (SELECT sheet_id FROM reservations WHERE event_id = ? AND canceled_at IS NULL FOR UPDATE) AND `rank` = ? ORDER BY RAND() LIMIT 1", eventID, params.Rank).Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
+			if err := tx.QueryRow("SELECT * FROM sheets WHERE NOT EXISTS (SELECT 1 FROM reservations WHERE sheet_id = sheets.id AND event_id = ? AND NOT is_canceled) AND `rank` = ? ORDER BY RAND() LIMIT 1 FOR UPDATE", eventID, params.Rank).Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
 				if err == sql.ErrNoRows {
 					return resError(c, "sold_out", 409)
 				}
