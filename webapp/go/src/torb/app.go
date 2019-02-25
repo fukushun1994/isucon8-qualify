@@ -25,6 +25,7 @@ import (
 	"github.com/labstack/echo/middleware"
 
 	"sync"
+	"math/rand"
 )
 
 type User struct {
@@ -198,13 +199,7 @@ func getLoginAdministrator(c echo.Context) (*Administrator, error) {
 }
 
 func getEvents(all bool) ([]*Event, error) {
-	tx, err := db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Commit()
-
-	rows, err := tx.Query("SELECT * FROM events ORDER BY id ASC")
+	rows, err := db.Query("SELECT * FROM events ORDER BY id ASC")
 	if err != nil {
 		return nil, err
 	}
@@ -292,8 +287,9 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 	defer ec.mux.Unlock()
 
 	var event Event
+	event.ID = eventID
 	// 指定されたIDのイベントを取得
-	if err := db.QueryRow("SELECT * FROM events WHERE id = ?", eventID).Scan(&event.ID, &event.Title, &event.PublicFg, &event.ClosedFg, &event.Price); err != nil {
+	if err := db.QueryRow("SELECT title, public_fg, closed_fg, price FROM events WHERE id = ?", eventID).Scan(&event.Title, &event.PublicFg, &event.ClosedFg, &event.Price); err != nil {
 		return nil, err
 	}
 	event.Sheets = map[string]*Sheets{
@@ -713,40 +709,48 @@ func main() {
 			return resError(c, "invalid_rank", 400)
 		}
 
-		var sheet Sheet
 		var reservationID int64
-		for {
-			tx, err := db.Begin()
+		tx, err := db.Begin()
 
-			if err != nil {
-				return err
-			}
+		if err != nil {
+			return err
+		}
 
-			if err := tx.QueryRow("SELECT * FROM sheets WHERE NOT EXISTS (SELECT 1 FROM reservations WHERE sheet_id = sheets.id AND event_id = ? AND NOT is_canceled) AND `rank` = ? ORDER BY RAND() LIMIT 1 FOR UPDATE", eventID, params.Rank).Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
-				if err == sql.ErrNoRows {
-					return resError(c, "sold_out", 409)
-				}
-				return err
+		rows, err := tx.Query("SELECT id, num FROM sheets WHERE NOT EXISTS (SELECT 1 FROM reservations WHERE sheet_id = sheets.id AND event_id = ? AND NOT is_canceled) AND `rank` = ? FOR UPDATE", eventID, params.Rank)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				return resError(c, "sold_out", 409)
 			}
+			return err
+		}
 
-			res, err := tx.Exec("INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?)", eventID, sheet.ID, user.ID, time.Now().UTC().Format("2006-01-02 15:04:05.000000"))
-			if err != nil {
-				tx.Rollback()
-				log.Println("re-try: rollback by", err)
-				continue
-			}
-			reservationID, err = res.LastInsertId()
-			if err != nil {
-				tx.Rollback()
-				log.Println("re-try: rollback by", err)
-				continue
-			}
-			if err := tx.Commit(); err != nil {
-				tx.Rollback()
-				log.Println("re-try: rollback by", err)
-				continue
-			}
-			break
+		availableIDs  := make([]int64, 0, sheetInfo.total[params.Rank])
+		availableNums  := make([]int64, 0, sheetInfo.total[params.Rank])
+		for rows.Next() {
+			var id int64
+			var num int64
+			rows.Scan(&id, &num)
+			availableIDs = append(availableIDs, id)
+			availableNums = append(availableNums, num)
+		}
+		selectID := rand.Intn(len(availableIDs))
+
+		res, err := tx.Exec("INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?)", eventID, availableIDs[selectID], user.ID, time.Now().UTC().Format("2006-01-02 15:04:05.000000"))
+		if err != nil {
+			tx.Rollback()
+			log.Println("re-try: rollback by", err)
+			return err
+		}
+		reservationID, err = res.LastInsertId()
+		if err != nil {
+			tx.Rollback()
+			log.Println("re-try: rollback by", err)
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			tx.Rollback()
+			log.Println("re-try: rollback by", err)
+			return err
 		}
 		if cacheFound {
 			ec.valid = false
@@ -754,7 +758,7 @@ func main() {
 		return c.JSON(202, echo.Map{
 			"id":         reservationID,
 			"sheet_rank": params.Rank,
-			"sheet_num":  sheet.Num,
+			"sheet_num":  availableNums[selectID],
 		})
 	}, loginRequired)
 	e.DELETE("/api/events/:id/sheets/:rank/:num/reservation", func(c echo.Context) error {
