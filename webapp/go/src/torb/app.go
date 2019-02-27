@@ -237,6 +237,29 @@ func rankToNum(rank string) int {
 	return -1
 }
 
+func sheetIDToNum(sheetID int64) int64 {
+	if sheetID > 500 {
+		return sheetID - 500
+	} else if sheetID > 200 {
+		return sheetID - 200
+	} else if sheetID > 50 {
+		return sheetID - 50
+	} else {
+		return sheetID
+	}
+}
+func sheetNumToID(sheetNum int64, rankNum int) int64 {
+	if rankNum == 3 {
+		return sheetNum + 500
+	} else if rankNum == 2 {
+		return sheetNum + 200
+	} else if rankNum == 1 {
+		return sheetNum + 50
+	} else {
+		return sheetNum
+	}
+}
+
 // ランクごとのシート数と料金を返す
 func getSheetInfo() ([]int, []int64, error) {
 	sheetTotal := []int {0, 0, 0, 0}
@@ -389,7 +412,6 @@ type SheetInfo struct {
 }
 
 var eventCache map[int64]*EventCache
-var eventUpdateMux sync.Mutex
 var sheetInfo SheetInfo
 
 func main() {
@@ -718,29 +740,45 @@ func main() {
 		if err != nil {
 			return err
 		}
+		
+		availableIDs := make([]int64, 500)
+		availableCnt := 0
+		usedIDs := make([]int64, 500)
+		usedCnt := 0
+		rankNum := rankToNum(params.Rank)
+		total := sheetInfo.total[rankNum]
 
-		rows, err := tx.Query("SELECT id, num FROM sheets WHERE NOT EXISTS (SELECT 1 FROM reservations WHERE sheet_id = sheets.id AND event_id = ? AND NOT is_canceled) AND `rank` = ? FOR UPDATE", eventID, params.Rank)
-		if err != nil {
-			if err == sql.ErrNoRows {
-				return resError(c, "sold_out", 409)
-			}
+		// 予約済みの座席を取得
+		rows, err := tx.Query("SELECT r.sheet_id FROM reservations AS r INNER JOIN sheets AS s ON r.sheet_id = s.id AND event_id = ? AND NOT is_canceled AND `rank` = ? ORDER BY s.id FOR UPDATE", eventID, params.Rank)
+		if err != nil && err != sql.ErrNoRows {
 			return err
 		}
-
-		rankNum := rankToNum(params.Rank)
-		availableIDs  := make([]int64, 0, sheetInfo.total[rankNum])
-		availableNums  := make([]int64, 0, sheetInfo.total[rankNum])
 		for rows.Next() {
 			var id int64
-			var num int64
-			rows.Scan(&id, &num)
-			availableIDs = append(availableIDs, id)
-			availableNums = append(availableNums, num)
+			rows.Scan(&id)
+			usedIDs[usedCnt] = id
+			usedCnt++
 		}
-		selectID := rand.Intn(len(availableIDs))
+		// 全部予約済みだったらエラー
+		if usedCnt == total {
+				return resError(c, "sold_out", 409)
+		}
+		// 予約可能な座席の配列を作成
+		j := 0
+		for i := 1; i <= total; i++ {
+			id := sheetNumToID(int64(i), rankNum)
+			if id == usedIDs[j] {
+				j++
+				continue
+			}
+			availableIDs[availableCnt] = id
+			availableCnt++
+		}
+		// ランダムに1つ選択
+		selectID := availableIDs[rand.Intn(availableCnt)]
 
 		reservedAt := time.Now().UTC()
-		res, err := tx.Exec("INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?)", eventID, availableIDs[selectID], user.ID, reservedAt.Format("2006-01-02 15:04:05.000000"))
+		res, err := tx.Exec("INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?)", eventID, selectID, user.ID, reservedAt.Format("2006-01-02 15:04:05.000000"))
 		if err != nil {
 			tx.Rollback()
 			log.Println("re-try: rollback by", err)
@@ -761,7 +799,7 @@ func main() {
 			ec.event.Remains--
 			ec.event.Sheets[params.Rank].Remains--
 			for _, s := range ec.event.Sheets[params.Rank].Detail {
-				if s.ID == availableIDs[selectID] {
+				if s.ID == selectID {
 					s.User = user.ID
 					s.Reserved = true
 					s.ReservedAt = &reservedAt
@@ -773,7 +811,7 @@ func main() {
 		return c.JSON(202, echo.Map{
 			"id":         reservationID,
 			"sheet_rank": params.Rank,
-			"sheet_num":  availableNums[selectID],
+			"sheet_num":  sheetIDToNum(selectID),
 		})
 	}, loginRequired)
 	e.DELETE("/api/events/:id/sheets/:rank/:num/reservation", func(c echo.Context) error {
@@ -784,32 +822,29 @@ func main() {
 		rank := c.Param("rank")
 		num := c.Param("num")
 
-		ec, cacheFound := eventCache[eventID]
-		if cacheFound {
-			ec.mux.Lock()
-			defer ec.mux.Unlock()
+		if !validateRank(rank) {
+			return resError(c, "invalid_rank", 404)
 		}
+
 
 		user, err := getLoginUser(c)
 		if err != nil {
 			return err
 		}
-		var isPublic bool
-		if err := db.QueryRow("SELECT public_fg FROM events WHERE id = ?", eventID).Scan(&isPublic); err != nil {
-			if err == sql.ErrNoRows {
+
+		ec, cacheFound := eventCache[eventID]
+		if cacheFound {
+			if !ec.event.PublicFg {
 				return resError(c, "invalid_event", 404)
 			}
-			return err
-		} else if !isPublic {
+			ec.mux.Lock()
+			defer ec.mux.Unlock()
+		} else {
 			return resError(c, "invalid_event", 404)
 		}
 
-		if !validateRank(rank) {
-			return resError(c, "invalid_rank", 404)
-		}
-
-		var sheet Sheet
-		if err := db.QueryRow("SELECT * FROM sheets WHERE `rank` = ? AND num = ?", rank, num).Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
+		var sheetID int64
+		if err := db.QueryRow("SELECT id FROM sheets WHERE `rank` = ? AND num = ?", rank, num).Scan(&sheetID); err != nil {
 			if err == sql.ErrNoRows {
 				return resError(c, "invalid_sheet", 404)
 			}
@@ -821,20 +856,21 @@ func main() {
 			return err
 		}
 
-		var reservation Reservation
-		if err := tx.QueryRow("SELECT id, event_id, sheet_id, user_id, reserved_at, canceled_at FROM reservations WHERE event_id = ? AND sheet_id = ? AND canceled_at IS NULL FOR UPDATE", eventID, sheet.ID).Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt); err != nil {
+		var reservationID int64
+		var userID int64
+		if err := tx.QueryRow("SELECT id, user_id FROM reservations WHERE event_id = ? AND sheet_id = ? AND NOT is_canceled FOR UPDATE", eventID, sheetID).Scan(&reservationID, &userID); err != nil {
 			tx.Rollback()
 			if err == sql.ErrNoRows {
 				return resError(c, "not_reserved", 400)
 			}
 			return err
 		}
-		if reservation.UserID != user.ID {
+		if userID != user.ID {
 			tx.Rollback()
 			return resError(c, "not_permitted", 403)
 		}
 
-		if _, err := tx.Exec("UPDATE reservations SET canceled_at = ?, is_canceled = TRUE WHERE id = ?", time.Now().UTC().Format("2006-01-02 15:04:05.000000"), reservation.ID); err != nil {
+		if _, err := tx.Exec("UPDATE reservations SET canceled_at = ?, is_canceled = TRUE WHERE id = ?", time.Now().UTC().Format("2006-01-02 15:04:05.000000"), reservationID); err != nil {
 			tx.Rollback()
 			return err
 		}
@@ -846,7 +882,7 @@ func main() {
 			ec.event.Remains++
 			ec.event.Sheets[rank].Remains++
 			for _, s := range ec.event.Sheets[rank].Detail {
-				if s.ID == sheet.ID {
+				if s.ID == sheetID {
 					s.User = -1
 					s.Reserved = false
 					s.ReservedAt = nil
