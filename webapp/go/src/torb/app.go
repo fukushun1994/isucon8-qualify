@@ -851,33 +851,18 @@ func main() {
 			return resError(c, "invalid_event", 404)
 		}
 
-		var reservationID int64
-		tx, err := db.Begin()
-
-		if err != nil {
-			return err
-		}
 
 		rankNum := rankToNum(params.Rank)
 		// ランダムに1席選択
 		selectID := availableSheets[eventID][rankNum].Take()
 
 		reservedAt := time.Now().UTC()
-		res, err := tx.Exec("INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?)", eventID, selectID, user.ID, reservedAt.Format("2006-01-02 15:04:05.000000"))
+		res, err := db.Exec("INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?)", eventID, selectID, user.ID, reservedAt.Format("2006-01-02 15:04:05.000000"))
 		if err != nil {
-			tx.Rollback()
-			log.Println("re-try: rollback by", err)
 			return err
 		}
-		reservationID, err = res.LastInsertId()
+		reservationID, err := res.LastInsertId()
 		if err != nil {
-			tx.Rollback()
-			log.Println("re-try: rollback by", err)
-			return err
-		}
-		if err := tx.Commit(); err != nil {
-			tx.Rollback()
-			log.Println("re-try: rollback by", err)
 			return err
 		}
 		if cacheFound {
@@ -1145,31 +1130,37 @@ func main() {
 			return resError(c, "not_found", 404)
 		}
 
-		rows, err := db.Query("SELECT r.id, r.user_id, r.reserved_at, r.canceled_at, s.rank AS sheet_rank, s.num AS sheet_num, s.price AS sheet_price, e.price AS event_price FROM reservations r INNER JOIN sheets s ON s.id = r.sheet_id INNER JOIN events e ON e.id = r.event_id WHERE r.event_id = ?", eventID)
+		rows, err := db.Query("SELECT r.id, r.user_id, r.reserved_at, r.canceled_at, s.rank, s.num, s.price, e.price FROM (reservations AS r INNER JOIN events AS e ON r.event_id = e.id AND e.id = ?) INNER JOIN sheets AS s ON r.sheet_id = s.id", eventID)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
 
 		var reports []Report
-		var reservation Reservation
-		var sheet Sheet
-		var event Event
+		var reservationID int64
+		var userID int64
+		var reservedAt *time.Time
+		var canceledAt *time.Time
+		var rank string
+		var sheetNum int64
+		var sheetPrice int64
+		var eventPrice int64
+
 		for rows.Next() {
-			if err := rows.Scan(&reservation.ID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &sheet.Rank, &sheet.Num, &sheet.Price, &event.Price); err != nil {
+			if err := rows.Scan(&reservationID, &userID, &reservedAt, &canceledAt, &rank, &sheetNum, &sheetPrice, &eventPrice); err != nil {
 				return err
 			}
 			report := Report{
-				ReservationID: reservation.ID,
+				ReservationID: reservationID,
 				EventID:       eventID,
-				Rank:          sheet.Rank,
-				Num:           sheet.Num,
-				UserID:        reservation.UserID,
-				SoldAt:        reservation.ReservedAt,
-				Price:         event.Price + sheet.Price,
+				Rank:          rank,
+				Num:           sheetNum,
+				UserID:        userID,
+				SoldAt:        reservedAt,
+				Price:         eventPrice + sheetPrice,
 			}
-			if reservation.CanceledAt != nil {
-				report.CanceledAt = reservation.CanceledAt
+			if canceledAt != nil {
+				report.CanceledAt = canceledAt
 			}
 			reports = append(reports, report)
 		}
@@ -1183,22 +1174,29 @@ func main() {
 		defer rows.Close()
 
 		var reports []Report
-		var reservation Reservation
-		var sheet Sheet
-		var event Event
+		var reservationID int64
+		var userID int64
+		var reservedAt *time.Time
+		var canceledAt *time.Time
+		var rank string
+		var sheetNum int64
+		var sheetPrice int64
+		var eventID int64
+		var eventPrice int64
+
 		for rows.Next() {
-			if err := rows.Scan(&reservation.ID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &sheet.Rank, &sheet.Num, &sheet.Price, &event.ID, &event.Price); err != nil {
+			if err := rows.Scan(&reservationID, &userID, &reservedAt, &canceledAt, &rank, &sheetNum, &sheetPrice, &eventID, &eventPrice); err != nil {
 				return err
 			}
 			report := Report{
-				ReservationID: reservation.ID,
-				EventID:       event.ID,
-				Rank:          sheet.Rank,
-				Num:           sheet.Num,
-				UserID:        reservation.UserID,
-				SoldAt:        reservation.ReservedAt,
-				CanceledAt:    reservation.CanceledAt,
-				Price:         event.Price + sheet.Price,
+				ReservationID: reservationID,
+				EventID:       eventID,
+				Rank:          rank,
+				Num:           sheetNum,
+				UserID:        userID,
+				SoldAt:        reservedAt,
+				CanceledAt:    canceledAt,
+				Price:         eventPrice + sheetPrice,
 			}
 			reports = append(reports, report)
 		}
