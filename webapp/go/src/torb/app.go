@@ -262,8 +262,8 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 	ec, cacheFound := eventCache[eventID]
 	if cacheFound && ec.valid {
 		// キャッシュがある場合
-		ec.mux.Lock()
-		defer ec.mux.Unlock()
+		ec.mux.RLock()
+		defer ec.mux.RUnlock()
 		for _, rank := range []string{ "S", "A", "B", "C" } {
 			for _, sheet := range ec.event.Sheets[rank].Detail {
 				sheet.Mine = sheet.User == loginUserID
@@ -273,15 +273,13 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 	}
 
 	// キャッシュのオブジェクト自体がない場合は新規に作成
-	eventUpdateMux.Lock()
-	defer eventUpdateMux.Unlock()
 	if !cacheFound {
 		eventCache[eventID] = new(EventCache)
 	}
 
 	ec, cacheFound = eventCache[eventID]
-	ec.mux.Lock()
-	defer ec.mux.Unlock()
+	ec.mux.RLock()
+	defer ec.mux.RUnlock()
 
 	var event Event
 	event.ID = eventID
@@ -381,7 +379,7 @@ var db *sql.DB
 
 type EventCache struct {
 	event *Event
-	mux sync.Mutex
+	mux sync.RWMutex
 	valid bool	// eventが有効なキャッシュかどうか
 }
 
@@ -923,7 +921,6 @@ func main() {
 		}
 		c.Bind(&params)
 
-		eventUpdateMux.Lock()
 		tx, err := db.Begin()
 		if err != nil {
 			return err
@@ -943,7 +940,6 @@ func main() {
 			return err
 		}
 		eventCache[eventID] = new(EventCache)
-		eventUpdateMux.Unlock()
 
 		event, err := getEvent(eventID, -1)
 		if err != nil {
