@@ -895,10 +895,10 @@ func main() {
 				break
 			}
 		}
+		ec.event.Sheets[params.Rank].Remains--
 
 		ec.mux.Lock()
 		ec.event.Remains--
-		ec.event.Sheets[params.Rank].Remains--
 		ec.mux.Unlock()
 		
 		return c.JSON(202, echo.Map{
@@ -984,9 +984,10 @@ func main() {
 				break
 			}
 		}
+		ec.event.Sheets[rank].Remains++
+
 		ec.mux.Lock()
 		ec.event.Remains++
-		ec.event.Sheets[rank].Remains++
 		ec.mux.Unlock()
 
 		return c.NoContent(204)
@@ -1167,7 +1168,7 @@ func main() {
 		}
 		defer rows.Close()
 
-		var reports []Report
+		var reports []*Report
 		var reservationID int64
 		var userID int64
 		var reservedAt *time.Time
@@ -1193,7 +1194,7 @@ func main() {
 			if canceledAt != nil {
 				report.CanceledAt = canceledAt
 			}
-			reports = append(reports, report)
+			reports = append(reports, &report)
 		}
 		return renderReportCSV(c, reports)
 	}, adminLoginRequired)
@@ -1204,7 +1205,7 @@ func main() {
 		}
 		defer rows.Close()
 
-		var reports []Report
+		var reports []*Report
 		var reservationID int64
 		var userID int64
 		var reservedAt *time.Time
@@ -1229,7 +1230,7 @@ func main() {
 				CanceledAt:    canceledAt,
 				Price:         eventPrice + sheetPrice,
 			}
-			reports = append(reports, report)
+			reports = append(reports, &report)
 		}
 		return renderReportCSV(c, reports)
 	}, adminLoginRequired)
@@ -1248,7 +1249,7 @@ type Report struct {
 	Price         int64
 }
 
-func renderReportCSV(c echo.Context, reports []Report) error {
+func renderReportCSV(c echo.Context, reports []*Report) error {
 	sort.Slice(reports, func(i, j int) bool { return reports[i].SoldAt.Before(*reports[j].SoldAt) })
 
 	body := bytes.NewBufferString("reservation_id,event_id,rank,num,price,user_id,sold_at,canceled_at\n")
