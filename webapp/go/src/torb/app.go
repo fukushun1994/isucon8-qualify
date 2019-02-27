@@ -424,6 +424,98 @@ type SheetInfo struct {
 	price []int64
 }
 
+type MyArray struct {
+	v [500]int64
+	length int
+}
+
+func (ma *MyArray) At(id int) int64 {
+	return ma.v[id]
+}
+
+func (ma *MyArray) Add(value int64) {
+	ma.v[ma.length] = value
+	ma.length++
+}
+
+func (ma *MyArray) Delete(id int) {
+	ma.v[id] = ma.v[ma.length-1]
+	ma.length--
+}
+
+// 空いてる座席のリストを保持する構造体
+type AvailableSheets struct {
+	sheets [4]*MyArray
+	mux sync.Mutex
+}
+
+// ランダムに1つ空いている座席を取得する
+// 空きがない場合は-1を返す
+func (as *AvailableSheets) Take(rankNum int) int64 {
+	as.mux.Lock()
+	defer as.mux.Unlock()
+	if as.sheets[rankNum].length == 0 {
+		return -1
+	}
+	id := rand.Intn(as.sheets[rankNum].length)
+	sheet := as.sheets[rankNum].At(id)
+	as.sheets[rankNum].Delete(id)
+	return sheet
+}
+
+// 指定したIDの座席を予約可能にする
+func (as *AvailableSheets) Enable(rankNum int, sheet int64) {
+	as.mux.Lock()
+	defer as.mux.Unlock()
+	as.sheets[rankNum].Add(sheet)
+}
+
+// 指定した座席を予約済みにする
+func (as *AvailableSheets) Disable(rankNum int, sheet int64) {
+	as.mux.Lock()
+	defer as.mux.Unlock()
+	for i := 0; i < as.sheets[rankNum].length; i++ {
+		if as.sheets[rankNum].At(i) == sheet {
+			as.sheets[rankNum].Delete(i)
+			break
+		}
+	}
+}
+
+func (as *AvailableSheets) Initialize() {
+	as.mux.Lock()
+	defer as.mux.Unlock()
+	id := 1
+	for rank := 0; rank < 4; rank++ {
+		as.sheets[rank] = new(MyArray)
+		for i := 0; i < sheetInfo.total[rank]; i++ {
+			as.sheets[rank].Add(int64(id))
+			id++
+		}
+	}
+}
+
+var availableSheets map[int64]*AvailableSheets
+
+// DBの状況を反映する
+func setAvailableSheetsFromDB() {
+	rows, _ := db.Query("SELECT e.id, s.id, s.rank FROM events AS e LEFT OUTER JOIN (reservations AS r INNER JOIN sheets AS s ON r.sheet_id = s.id) ON e.id = r.event_id AND NOT r.is_canceled")
+	for rows.Next() {
+		var eventID int64
+		var sheetID int64
+		var rank string
+		rows.Scan(&eventID, &sheetID, &rank)
+		_, found := availableSheets[eventID]
+		if !found {
+			availableSheets[eventID] = new(AvailableSheets)
+			availableSheets[eventID].Initialize()
+		}
+		if sheetID > 0 {
+			availableSheets[eventID].Disable(rankToNum(rank), sheetID)
+		}
+	}
+}
+
 var eventCache map[int64]*EventCache
 var sheetInfo SheetInfo
 
@@ -439,7 +531,8 @@ func main() {
 	)
 
 	eventCache = make(map[int64]*EventCache)
-
+	availableSheets = make(map[int64]*AvailableSheets)
+	
 	var err error
 	db, err = sql.Open("mysql", dsn)
 	if err != nil {
@@ -448,6 +541,9 @@ func main() {
 
 	// 座席の静的な情報は最初に取得
 	sheetInfo.total, sheetInfo.price, _ = getSheetInfo()
+
+	// 予約可能な座席情報を取得する
+	setAvailableSheetsFromDB()
 
 	e := echo.New()
 	funcs := template.FuncMap{
@@ -641,7 +737,6 @@ func main() {
 		if err := db.QueryRow("SELECT IFNULL(SUM(e.price + s.price), 0) FROM reservations r INNER JOIN sheets s ON s.id = r.sheet_id INNER JOIN events e ON e.id = r.event_id WHERE r.user_id = ? AND NOT r.is_canceled", user.ID).Scan(&totalPrice); err != nil {
 			return err
 		}
-
 		return c.JSON(200, echo.Map{
 			"id":                  user.ID,
 			"nickname":            user.Nickname,
@@ -753,42 +848,10 @@ func main() {
 		if err != nil {
 			return err
 		}
-		
-		availableIDs := make([]int64, 500)
-		availableCnt := 0
-		usedIDs := make([]int64, 500)
-		usedCnt := 0
-		rankNum := rankToNum(params.Rank)
-		total := sheetInfo.total[rankNum]
 
-		// 予約済みの座席を取得
-		rows, err := tx.Query("SELECT r.sheet_id FROM reservations AS r INNER JOIN sheets AS s ON r.sheet_id = s.id AND event_id = ? AND NOT is_canceled AND `rank` = ? ORDER BY s.id FOR UPDATE", eventID, params.Rank)
-		if err != nil && err != sql.ErrNoRows {
-			return err
-		}
-		for rows.Next() {
-			var id int64
-			rows.Scan(&id)
-			usedIDs[usedCnt] = id
-			usedCnt++
-		}
-		// 全部予約済みだったらエラー
-		if usedCnt == total {
-				return resError(c, "sold_out", 409)
-		}
-		// 予約可能な座席の配列を作成
-		j := 0
-		for i := 1; i <= total; i++ {
-			id := sheetNumToID(int64(i), rankNum)
-			if id == usedIDs[j] {
-				j++
-				continue
-			}
-			availableIDs[availableCnt] = id
-			availableCnt++
-		}
-		// ランダムに1つ選択
-		selectID := availableIDs[rand.Intn(availableCnt)]
+		rankNum := rankToNum(params.Rank)
+		// ランダムに1席選択
+		selectID := availableSheets[eventID].Take(rankNum)
 
 		reservedAt := time.Now().UTC()
 		res, err := tx.Exec("INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?)", eventID, selectID, user.ID, reservedAt.Format("2006-01-02 15:04:05.000000"))
@@ -891,6 +954,9 @@ func main() {
 		if err := tx.Commit(); err != nil {
 			return err
 		}
+		// 予約可能にする
+		availableSheets[eventID].Enable(rankToNum(rank), sheetID)
+
 		if cacheFound {
 			ec.event.Remains++
 			ec.event.Sheets[rank].Remains++
@@ -989,6 +1055,8 @@ func main() {
 			return err
 		}
 		eventCache[eventID] = new(EventCache)
+		availableSheets[eventID] = new(AvailableSheets)
+		availableSheets[eventID].Initialize()
 
 		event, err := getEvent(eventID, -1)
 		if err != nil {
