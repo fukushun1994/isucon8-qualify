@@ -285,12 +285,12 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 	ec, cacheFound := eventCache[eventID]
 	if cacheFound && ec.valid {
 		// キャッシュがある場合
-		ec.mux.RLock()
-		defer ec.mux.RUnlock()
-		for _, rank := range []string{ "S", "A", "B", "C" } {
+		for i, rank := range []string{ "S", "A", "B", "C" } {
+			ec.rankMux[i].RLock()
 			for _, sheet := range ec.event.Sheets[rank].Detail {
 				sheet.Mine = sheet.User == loginUserID
 			}
+			ec.rankMux[i].RUnlock()
 		}
 		return ec.event, nil
 	}
@@ -303,6 +303,10 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 	ec, cacheFound = eventCache[eventID]
 	ec.mux.RLock()
 	defer ec.mux.RUnlock()
+	for i := 0; i < 4; i++ {
+		ec.rankMux[i].RLock()
+		defer ec.rankMux[i].RUnlock()
+	}
 
 	var event Event
 	event.ID = eventID
@@ -416,6 +420,7 @@ var db *sql.DB
 type EventCache struct {
 	event *Event
 	mux sync.RWMutex
+	rankMux [4]sync.RWMutex
 	valid bool	// eventが有効なキャッシュかどうか
 }
 
@@ -839,10 +844,11 @@ func main() {
 			return err
 		}
 
+		rankNum := rankToNum(params.Rank)
 		ec, cacheFound := eventCache[eventID]
 		if cacheFound {
-			ec.mux.Lock()
-			defer ec.mux.Unlock()
+			ec.rankMux[rankNum].Lock()
+			defer ec.rankMux[rankNum].Unlock()
 		} else {
 			return resError(c, "invalid_event", 404)
 		}
@@ -851,8 +857,6 @@ func main() {
 			return resError(c, "invalid_event", 404)
 		}
 
-
-		rankNum := rankToNum(params.Rank)
 		// ランダムに1席選択
 		selectID := availableSheets[eventID][rankNum].Take()
 
@@ -865,19 +869,21 @@ func main() {
 		if err != nil {
 			return err
 		}
-		if cacheFound {
-			ec.event.Remains--
-			ec.event.Sheets[params.Rank].Remains--
-			for _, s := range ec.event.Sheets[params.Rank].Detail {
-				if s.ID == selectID {
-					s.User = user.ID
-					s.Reserved = true
-					s.ReservedAt = &reservedAt
-					s.ReservedAtUnix = reservedAt.Unix()
-					break
-				}
+		for _, s := range ec.event.Sheets[params.Rank].Detail {
+			if s.ID == selectID {
+				s.User = user.ID
+				s.Reserved = true
+				s.ReservedAt = &reservedAt
+				s.ReservedAtUnix = reservedAt.Unix()
+				break
 			}
 		}
+
+		ec.mux.Lock()
+		ec.event.Remains--
+		ec.event.Sheets[params.Rank].Remains--
+		ec.mux.Unlock()
+		
 		return c.JSON(202, echo.Map{
 			"id":         reservationID,
 			"sheet_rank": params.Rank,
@@ -908,18 +914,19 @@ func main() {
 			return err
 		}
 
+		rankNum := rankToNum(rank)
 		ec, cacheFound := eventCache[eventID]
 		if cacheFound {
 			if !ec.event.PublicFg {
 				return resError(c, "invalid_event", 404)
 			}
-			ec.mux.Lock()
-			defer ec.mux.Unlock()
+			ec.rankMux[rankNum].Lock()
+			defer ec.rankMux[rankNum].Unlock()
 		} else {
 			return resError(c, "invalid_event", 404)
 		}
 
-		sheetID := sheetNumToID(num, rankToNum(rank))
+		sheetID := sheetNumToID(num, rankNum)
 
 		tx, err := db.Begin()
 		if err != nil {
@@ -949,21 +956,22 @@ func main() {
 			return err
 		}
 		// 予約可能にする
-		availableSheets[eventID][rankToNum(rank)].Enable(sheetID)
+		availableSheets[eventID][rankNum].Enable(sheetID)
 
-		if cacheFound {
-			ec.event.Remains++
-			ec.event.Sheets[rank].Remains++
-			for _, s := range ec.event.Sheets[rank].Detail {
-				if s.ID == sheetID {
-					s.User = -1
-					s.Reserved = false
-					s.ReservedAt = nil
-					s.ReservedAtUnix = 0
-					break
-				}
+		for _, s := range ec.event.Sheets[rank].Detail {
+			if s.ID == sheetID {
+				s.User = -1
+				s.Reserved = false
+				s.ReservedAt = nil
+				s.ReservedAtUnix = 0
+				break
 			}
 		}
+		ec.mux.Lock()
+		ec.event.Remains++
+		ec.event.Sheets[rank].Remains++
+		ec.mux.Unlock()
+
 		return c.NoContent(204)
 	}, loginRequired)
 	e.GET("/admin/", func(c echo.Context) error {
