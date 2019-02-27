@@ -741,7 +741,8 @@ func main() {
 		}
 		selectID := rand.Intn(len(availableIDs))
 
-		res, err := tx.Exec("INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?)", eventID, availableIDs[selectID], user.ID, time.Now().UTC().Format("2006-01-02 15:04:05.000000"))
+		reservedAt := time.Now().UTC()
+		res, err := tx.Exec("INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?)", eventID, availableIDs[selectID], user.ID, reservedAt.Format("2006-01-02 15:04:05.000000"))
 		if err != nil {
 			tx.Rollback()
 			log.Println("re-try: rollback by", err)
@@ -759,7 +760,17 @@ func main() {
 			return err
 		}
 		if cacheFound {
-			ec.valid = false
+			ec.event.Remains--
+			ec.event.Sheets[params.Rank].Remains--
+			for _, s := range ec.event.Sheets[params.Rank].Detail {
+				if s.ID == availableIDs[selectID] {
+					s.User = user.ID
+					s.Reserved = true
+					s.ReservedAt = &reservedAt
+					s.ReservedAtUnix = reservedAt.Unix()
+					break
+				}
+			}
 		}
 		return c.JSON(202, echo.Map{
 			"id":         reservationID,
@@ -834,7 +845,17 @@ func main() {
 			return err
 		}
 		if cacheFound {
-			ec.valid = false
+			ec.event.Remains++
+			ec.event.Sheets[rank].Remains++
+			for _, s := range ec.event.Sheets[rank].Detail {
+				if s.ID == sheet.ID {
+					s.User = -1
+					s.Reserved = false
+					s.ReservedAt = nil
+					s.ReservedAtUnix = 0
+					break
+				}
+			}
 		}
 		return c.NoContent(204)
 	}, loginRequired)
@@ -993,9 +1014,6 @@ func main() {
 		}
 		event.PublicFg = params.Public
 		event.ClosedFg = params.Closed
-		if cacheFound {
-			ec.valid = false
-		}
 
 		c.JSON(200, event)
 		return nil
