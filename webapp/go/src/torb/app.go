@@ -445,57 +445,67 @@ func (ma *MyArray) Delete(id int) {
 
 // 空いてる座席のリストを保持する構造体
 type AvailableSheets struct {
-	sheets [4]*MyArray
+	sheets *MyArray
 	mux sync.Mutex
 }
 
 // ランダムに1つ空いている座席を取得する
 // 空きがない場合は-1を返す
-func (as *AvailableSheets) Take(rankNum int) int64 {
+func (as *AvailableSheets) Take() int64 {
 	as.mux.Lock()
 	defer as.mux.Unlock()
-	if as.sheets[rankNum].length == 0 {
+	if as.sheets.length == 0 {
 		return -1
 	}
-	id := rand.Intn(as.sheets[rankNum].length)
-	sheet := as.sheets[rankNum].At(id)
-	as.sheets[rankNum].Delete(id)
+	id := rand.Intn(as.sheets.length)
+	sheet := as.sheets.At(id)
+	as.sheets.Delete(id)
 	return sheet
 }
 
 // 指定したIDの座席を予約可能にする
-func (as *AvailableSheets) Enable(rankNum int, sheet int64) {
+func (as *AvailableSheets) Enable(sheet int64) {
 	as.mux.Lock()
 	defer as.mux.Unlock()
-	as.sheets[rankNum].Add(sheet)
+	as.sheets.Add(sheet)
 }
 
 // 指定した座席を予約済みにする
-func (as *AvailableSheets) Disable(rankNum int, sheet int64) {
+func (as *AvailableSheets) Disable(sheet int64) {
 	as.mux.Lock()
 	defer as.mux.Unlock()
-	for i := 0; i < as.sheets[rankNum].length; i++ {
-		if as.sheets[rankNum].At(i) == sheet {
-			as.sheets[rankNum].Delete(i)
+	for i := 0; i < as.sheets.length; i++ {
+		if as.sheets.At(i) == sheet {
+			as.sheets.Delete(i)
 			break
 		}
 	}
 }
 
-func (as *AvailableSheets) Initialize() {
+func (as *AvailableSheets) Initialize(firstID int64, lastID int64) {
 	as.mux.Lock()
 	defer as.mux.Unlock()
-	id := 1
-	for rank := 0; rank < 4; rank++ {
-		as.sheets[rank] = new(MyArray)
-		for i := 0; i < sheetInfo.total[rank]; i++ {
-			as.sheets[rank].Add(int64(id))
-			id++
-		}
+	as.sheets = new(MyArray)
+	for id := firstID; id <= lastID; id++ {
+		as.sheets.Add(id)
 	}
 }
 
-var availableSheets map[int64]*AvailableSheets
+var availableSheets map[int64][4]*AvailableSheets
+
+func initilizeAvailableSheetsEachRank(eventID int64) {
+	availableSheets[eventID] = [4]*AvailableSheets{
+		new(AvailableSheets),
+		new(AvailableSheets),
+		new(AvailableSheets),
+		new(AvailableSheets),
+	}
+	var firstID int64 = 1
+	for i := 0; i < 4; i++ {
+		availableSheets[eventID][i].Initialize(firstID, firstID + int64(sheetInfo.total[i]) - 1)
+		firstID += int64(sheetInfo.total[i])
+	}
+}
 
 // DBの状況を反映する
 func setAvailableSheetsFromDB() {
@@ -507,11 +517,10 @@ func setAvailableSheetsFromDB() {
 		rows.Scan(&eventID, &sheetID, &rank)
 		_, found := availableSheets[eventID]
 		if !found {
-			availableSheets[eventID] = new(AvailableSheets)
-			availableSheets[eventID].Initialize()
+			initilizeAvailableSheetsEachRank(eventID)
 		}
 		if sheetID > 0 {
-			availableSheets[eventID].Disable(rankToNum(rank), sheetID)
+			availableSheets[eventID][rankToNum(rank)].Disable(sheetID)
 		}
 	}
 }
@@ -531,7 +540,7 @@ func main() {
 	)
 
 	eventCache = make(map[int64]*EventCache)
-	availableSheets = make(map[int64]*AvailableSheets)
+	availableSheets = make(map[int64][4]*AvailableSheets)
 	
 	var err error
 	db, err = sql.Open("mysql", dsn)
@@ -851,7 +860,7 @@ func main() {
 
 		rankNum := rankToNum(params.Rank)
 		// ランダムに1席選択
-		selectID := availableSheets[eventID].Take(rankNum)
+		selectID := availableSheets[eventID][rankNum].Take()
 
 		reservedAt := time.Now().UTC()
 		res, err := tx.Exec("INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?)", eventID, selectID, user.ID, reservedAt.Format("2006-01-02 15:04:05.000000"))
@@ -955,7 +964,7 @@ func main() {
 			return err
 		}
 		// 予約可能にする
-		availableSheets[eventID].Enable(rankToNum(rank), sheetID)
+		availableSheets[eventID][rankToNum(rank)].Enable(sheetID)
 
 		if cacheFound {
 			ec.event.Remains++
@@ -1055,8 +1064,7 @@ func main() {
 			return err
 		}
 		eventCache[eventID] = new(EventCache)
-		availableSheets[eventID] = new(AvailableSheets)
-		availableSheets[eventID].Initialize()
+		initilizeAvailableSheetsEachRank(eventID)
 
 		event, err := getEvent(eventID, -1)
 		if err != nil {
