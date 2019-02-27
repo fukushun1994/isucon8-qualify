@@ -389,6 +389,19 @@ func fillinAdministrator(next echo.HandlerFunc) echo.HandlerFunc {
 func validateRank(rank string) bool {
 	return rankToNum(rank) != -1
 }
+func validateNum(rank string, num int64) bool {
+	switch rank {
+	case "C":
+		return 1 <= num && num <= 500
+	case "B":
+		return 1 <= num && num <= 300
+	case "A":
+		return 1 <= num && num <= 150
+	case "S":
+		return 1 <= num && num <= 50
+	}
+	return false
+}
 
 type Renderer struct {
 	templates *template.Template
@@ -820,12 +833,18 @@ func main() {
 			return resError(c, "not_found", 404)
 		}
 		rank := c.Param("rank")
-		num := c.Param("num")
+		num, err := strconv.ParseInt(c.Param("num"), 10, 64)
+		if err != nil {
+			return resError(c, "invalid_sheet", 404)
+		}
 
 		if !validateRank(rank) {
 			return resError(c, "invalid_rank", 404)
 		}
 
+		if !validateNum(rank, num) {
+			return resError(c, "invalid_sheet", 404)
+		}
 
 		user, err := getLoginUser(c)
 		if err != nil {
@@ -843,13 +862,7 @@ func main() {
 			return resError(c, "invalid_event", 404)
 		}
 
-		var sheetID int64
-		if err := db.QueryRow("SELECT id FROM sheets WHERE `rank` = ? AND num = ?", rank, num).Scan(&sheetID); err != nil {
-			if err == sql.ErrNoRows {
-				return resError(c, "invalid_sheet", 404)
-			}
-			return err
-		}
+		sheetID := sheetNumToID(num, rankToNum(rank))
 
 		tx, err := db.Begin()
 		if err != nil {
