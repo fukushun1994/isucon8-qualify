@@ -282,8 +282,11 @@ func getSheetInfo() ([]int, []int64, error) {
 }
 
 func getEvent(eventID, loginUserID int64) (*Event, error) {
-	ec, cacheFound := eventCache[eventID]
-	if cacheFound && ec.valid {
+	var ec *EventCache
+	if eventID < int64(len(eventCache)) {
+		ec = eventCache[eventID]
+	}
+	if ec != nil && ec.valid {
 		// キャッシュがある場合
 		for i, rank := range []string{ "S", "A", "B", "C" } {
 			ec.rankMux[i].RLock()
@@ -296,11 +299,15 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 	}
 
 	// キャッシュのオブジェクト自体がない場合は新規に作成
-	if !cacheFound {
+	if ec == nil && eventID >= int64(len(eventCache)){
+		for i := int64(len(eventCache)); i <= eventID; i++ {
+			eventCache = append(eventCache, new(EventCache))
+		}
+	} else {
 		eventCache[eventID] = new(EventCache)
 	}
 
-	ec, cacheFound = eventCache[eventID]
+	ec = eventCache[eventID]
 	ec.mux.RLock()
 	defer ec.mux.RUnlock()
 	for i := 0; i < 4; i++ {
@@ -496,7 +503,7 @@ func (as *AvailableSheets) Initialize(firstID int64, lastID int64) {
 	}
 }
 
-var availableSheets map[int64][4]*AvailableSheets
+var availableSheets [][4]*AvailableSheets
 
 func initilizeAvailableSheetsEachRank(eventID int64) {
 	availableSheets[eventID] = [4]*AvailableSheets{
@@ -520,9 +527,19 @@ func setAvailableSheetsFromDB() {
 		var sheetID int64
 		var rank string
 		rows.Scan(&eventID, &sheetID, &rank)
-		_, found := availableSheets[eventID]
-		if !found {
-			initilizeAvailableSheetsEachRank(eventID)
+		var sheets [4]*AvailableSheets
+		if eventID < int64(len(availableSheets)) {
+			sheets = availableSheets[eventID]
+		} 
+		if sheets[0] == nil {
+			if eventID < int64(len(availableSheets)) {
+				initilizeAvailableSheetsEachRank(eventID)
+			} else{
+				for i := int64(len(availableSheets)); i <= eventID; i++ {
+					availableSheets = append(availableSheets, [4]*AvailableSheets{})
+					initilizeAvailableSheetsEachRank(i)
+				}
+			}
 		}
 		if sheetID > 0 {
 			availableSheets[eventID][rankToNum(rank)].Disable(sheetID)
@@ -530,7 +547,7 @@ func setAvailableSheetsFromDB() {
 	}
 }
 
-var eventCache map[int64]*EventCache
+var eventCache []*EventCache
 var sheetInfo SheetInfo
 
 func main() {
@@ -544,8 +561,8 @@ func main() {
 		os.Getenv("DB_DATABASE"),
 	)
 
-	eventCache = make(map[int64]*EventCache)
-	availableSheets = make(map[int64][4]*AvailableSheets)
+	eventCache = make([]*EventCache, 30)
+	availableSheets = make([][4]*AvailableSheets, 30)
 	
 	var err error
 	db, err = sql.Open("mysql", dsn)
@@ -845,8 +862,8 @@ func main() {
 		}
 
 		rankNum := rankToNum(params.Rank)
-		ec, cacheFound := eventCache[eventID]
-		if cacheFound {
+		ec := eventCache[eventID]
+		if ec != nil {
 			ec.rankMux[rankNum].Lock()
 			defer ec.rankMux[rankNum].Unlock()
 		} else {
@@ -915,8 +932,8 @@ func main() {
 		}
 
 		rankNum := rankToNum(rank)
-		ec, cacheFound := eventCache[eventID]
-		if cacheFound {
+		ec := eventCache[eventID]
+		if ec != nil {
 			if !ec.event.PublicFg {
 				return resError(c, "invalid_event", 404)
 			}
@@ -1056,7 +1073,13 @@ func main() {
 		if err := tx.Commit(); err != nil {
 			return err
 		}
-		eventCache[eventID] = new(EventCache)
+		if eventID >= int64(len(eventCache)) {
+			for i := int64(len(eventCache)); i <= eventID; i++ {
+				eventCache = append(eventCache, new(EventCache))
+			}
+		} else {
+			eventCache[eventID] = new(EventCache)
+		}
 		initilizeAvailableSheetsEachRank(eventID)
 
 		event, err := getEvent(eventID, -1)
@@ -1109,8 +1132,8 @@ func main() {
 			return resError(c, "cannot_close_public_event", 400)
 		}
 
-		ec, cacheFound := eventCache[eventID]
-		if cacheFound {
+		ec := eventCache[eventID]
+		if ec != nil {
 			ec.mux.Lock()
 			defer ec.mux.Unlock()
 		}
