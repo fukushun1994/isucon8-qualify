@@ -11,7 +11,6 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"sort"
 	"strconv"
 	"time"
 	"net/http"
@@ -27,6 +26,7 @@ import (
 	"math/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"sort"
 )
 
 type User struct {
@@ -344,6 +344,7 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 	var userID sql.NullInt64
 	var reservedAt *time.Time
 	var remains [4]int
@@ -524,6 +525,7 @@ func initilizeAvailableSheetsEachRank(eventID int64) {
 // DBの状況を反映する
 func setAvailableSheetsFromDB() {
 	rows, _ := db.Query("SELECT e.id, s.id, s.rank FROM events AS e LEFT OUTER JOIN (reservations AS r INNER JOIN sheets AS s ON r.sheet_id = s.id) ON e.id = r.event_id AND NOT r.is_canceled")
+	defer rows.Close()
 	for rows.Next() {
 		var eventID int64
 		var sheetID int64
@@ -549,19 +551,42 @@ func setAvailableSheetsFromDB() {
 	}
 }
 
-func InitializeReportRenderer() {
-	rows, _ := db.Query("SELECT id FROM events")
+func initializeReport() {
+	rows, _ := db.Query("select r.id, r.user_id, r.reserved_at, r.canceled_at, s.rank, s.num, s.price, e.id, e.price from reservations r inner join sheets s on s.id = r.sheet_id inner join events e on e.id = r.event_id")
+	defer rows.Close()
+
+	var reservationID int64
+	var userID int64
+	var reservedAt *time.Time
+	var canceledAt *time.Time
+	var rank string
+	var sheetNum int64
+	var sheetPrice int64
+	var eventID int64
+	var eventPrice int64
+
 	for rows.Next() {
-		var eventID int64
-		rows.Scan(&eventID)
-		reportRenderers[eventID] = NewReportRenderer(eventID)
+		rows.Scan(&reservationID, &userID, &reservedAt, &canceledAt, &rank, &sheetNum, &sheetPrice, &eventID, &eventPrice)
+		report := Report{
+			ReservationID: reservationID,
+			EventID:       eventID,
+			Rank:          rank,
+			Num:           sheetNum,
+			UserID:        userID,
+			SoldAt:        reservedAt,
+			Price:         eventPrice + sheetPrice,
+		}
+		reportRenderer.reports = append(reportRenderer.reports, &report)
+		if canceledAt != nil {
+			reservationCanceledAt[reservationID] = canceledAt
+		}
 	}
+	sort.Slice(reportRenderer.reports, func(i, j int) bool { return reportRenderer.reports[i].SoldAt.Before(*reportRenderer.reports[j].SoldAt) })
 }
 
 var eventCache []*EventCache
 var sheetInfo SheetInfo
-var allReportRender *ReportRenderer
-var reportRenderers []*ReportRenderer
+var reportRenderer *ReportRenderer
 
 func main() {
 	go func() {
@@ -590,9 +615,10 @@ func main() {
 	setAvailableSheetsFromDB()
 
 	// レポートの初期化
-	allReportRender = NewReportRenderer(-1)
-	reportRenderers = make([]*ReportRenderer, 30)
-	InitializeReportRenderer()
+	reportRenderer = NewReportRenderer()
+	reservationCanceledAt = make(map[int64]*time.Time)
+	initializeReport()
+	
 
 	e := echo.New()
 	funcs := template.FuncMap{
@@ -904,6 +930,18 @@ func main() {
 		if err != nil {
 			return err
 		}
+		go func() {
+			report := Report{
+				ReservationID: reservationID,
+				EventID:       eventID,
+				Rank:          params.Rank,
+				Num:           sheetIDToNum(selectID),
+				UserID:        user.ID,
+				SoldAt:        &reservedAt,
+				Price:         ec.event.Price + sheetInfo.price[rankNum],
+			}
+			reportRenderer.reportChan <- &report
+		}()
 
 		ec.rankMux[rankNum].Lock()
 		for _, s := range ec.event.Sheets[params.Rank].Detail {
@@ -983,10 +1021,12 @@ func main() {
 			return resError(c, "not_permitted", 403)
 		}
 
-		if _, err := tx.Exec("UPDATE reservations SET canceled_at = ?, is_canceled = TRUE WHERE id = ?", time.Now().UTC().Format("2006-01-02 15:04:05.000000"), reservationID); err != nil {
+		canceledAt := time.Now().UTC()
+		if _, err := tx.Exec("UPDATE reservations SET canceled_at = ?, is_canceled = TRUE WHERE id = ?", canceledAt.Format("2006-01-02 15:04:05.000000"), reservationID); err != nil {
 			tx.Rollback()
 			return err
 		}
+		reservationCanceledAt[reservationID] = &canceledAt
 
 		if err := tx.Commit(); err != nil {
 			return err
@@ -1102,11 +1142,9 @@ func main() {
 		if eventID >= int64(len(eventCache)) {
 			for i := int64(len(eventCache)); i <= eventID; i++ {
 				eventCache = append(eventCache, new(EventCache))
-				reportRenderers = append(reportRenderers, NewReportRenderer(i))
 			}
 		} else {
 			eventCache[eventID] = new(EventCache)
-			reportRenderers[eventID] = NewReportRenderer(eventID)
 		}
 		initilizeAvailableSheetsEachRank(eventID)
 
@@ -1226,8 +1264,8 @@ func main() {
 		}
 		return renderReportCSV(c, reports)
 		*/
-		reportRenderers[eventID].inChan <- c
-		return <- reportRenderers[eventID].outChan
+		reportRenderer.inChan <- &ReportRequest{context: c, eventID: eventID}
+		return <- reportRenderer.outChan
 	}, adminLoginRequired)
 	e.GET("/admin/api/reports/sales", func(c echo.Context) error {
 		/*
@@ -1266,8 +1304,8 @@ func main() {
 		}
 		return renderReportCSV(c, reports)
 		*/
-		allReportRender.inChan <- c
-		return <- allReportRender.outChan
+		reportRenderer.inChan <- &ReportRequest{context: c, eventID: -1}
+		return <- reportRenderer.outChan
 	}, adminLoginRequired)
 
 	e.Start(":8080")
@@ -1284,14 +1322,16 @@ type Report struct {
 	Price         int64
 }
 
-func renderReportCSV(c echo.Context, reports []*Report) error {
-	sort.Slice(reports, func(i, j int) bool { return reports[i].SoldAt.Before(*reports[j].SoldAt) })
-
+func renderReportCSV(c echo.Context, reports []*Report, eventID int64) error {
+	//sort.Slice(reports, func(i, j int) bool { return reports[i].SoldAt.Before(*reports[j].SoldAt) })
 	body := bytes.NewBufferString("reservation_id,event_id,rank,num,price,user_id,sold_at,canceled_at\n")
 	for _, v := range reports {
+		if eventID != -1 && v.EventID != eventID {
+			continue
+		}
 		var canceledAt string
-		if v.CanceledAt != nil {
-			canceledAt = v.CanceledAt.Format("2006-01-02T15:04:05.000000Z")
+		if t, found := reservationCanceledAt[v.ReservationID]; found {
+			canceledAt = t.Format("2006-01-02T15:04:05.000000Z")
 		}
 		body.WriteString(fmt.Sprintf("%d,%d,%s,%d,%d,%d,%s,%s\n",
 			v.ReservationID, v.EventID, v.Rank, v.Num, v.Price, v.UserID, v.SoldAt.Format("2006-01-02T15:04:05.000000Z"), canceledAt))
@@ -1314,67 +1354,46 @@ func resError(c echo.Context, e string, status int) error {
 }
 
 type ReportRenderer struct {
-	inChan chan echo.Context
+	inChan chan *ReportRequest
 	outChan chan error
-	lastID int64
+	reportChan chan *Report
+	lastTime *time.Time
+	reports []*Report
+	reportsByEvent[][]*Report
 }
 
-func NewReportRenderer(eventID int64) *ReportRenderer {
+type ReportRequest struct {
+	context echo.Context
+	eventID int64
+}
+
+var reservationCanceledAt map[int64]*time.Time
+
+func NewReportRenderer() *ReportRenderer {
 	rr := new(ReportRenderer)
-	rr.inChan = make(chan echo.Context)
+	rr.inChan = make(chan *ReportRequest)
 	rr.outChan = make(chan error)
-	rr.lastID = -1
+	rr.reportChan = make(chan *Report)
+	rr.reports = make([]*Report, 0, 200000)
+	rr.lastTime = new(time.Time)
 	go func() {
-		body := []byte("reservation_id,event_id,rank,num,price,user_id,sold_at,canceled_at\n")
-		
-		var rows *sql.Rows
-		var err error
 		for true {
-			c := <- rr.inChan
-			if eventID == -1 {
-				rows, err = db.Query("SELECT r.id, r.user_id, r.reserved_at, r.canceled_at, s.rank, s.num, s.price, e.id, e.price FROM reservations r INNER JOIN sheets AS s ON s.id = r.sheet_id INNER JOIN events AS e ON e.id = r.event_id WHERE r.id > ? ORDER BY r.id", rr.lastID)
-			} else {
-				rows, err = db.Query("SELECT r.id, r.user_id, r.reserved_at, r.canceled_at, s.rank, s.num, s.price, e.id, e.price FROM reservations r INNER JOIN sheets AS s ON s.id = r.sheet_id INNER JOIN events AS e ON e.id = r.event_id WHERE r.id > ? AND e.id = ? ORDER BY r.id", rr.lastID, eventID)
-			}
-			if err != nil {
-				rr.outChan <- err
-				continue
-			}
-			defer rows.Close()
-
-			var reservationID int64
-			var userID int64
-			var reservedAt *time.Time
-			var canceledAt *time.Time
-			var rank string
-			var sheetNum int64
-			var sheetPrice int64
-			var r_eventID int64
-			var eventPrice int64
-
-			var canceledAtStr string
-			var flag bool
-			for rows.Next() {
-				if err := rows.Scan(&reservationID, &userID, &reservedAt, &canceledAt, &rank, &sheetNum, &sheetPrice, &r_eventID, &eventPrice); err != nil {
-					rr.outChan <- err
-					flag = true
-					break
+			select {
+			case req := <- rr.inChan:
+				rr.outChan <- renderReportCSV(req.context, rr.reports, req.eventID)
+			case r := <- rr.reportChan:
+				var flag bool
+				for i := len(rr.reports)-1; i >= 0; i-- {
+					if r.SoldAt.After(*rr.reports[i].SoldAt) {
+						rr.reports = append(rr.reports[:i+1], append([]*Report{r}, rr.reports[i+1:]...)...)
+						flag = true
+						break
+					}
 				}
-				if canceledAt != nil {
-					canceledAtStr = canceledAt.Format("2006-01-02T15:04:05.000000Z")
+				if !flag {
+					rr.reports = append([]*Report{r}, rr.reports...)
 				}
-				rowStr := fmt.Sprintf("%d,%d,%s,%d,%d,%d,%s,%s\n",
-					reservationID, r_eventID, rank, sheetNum, eventPrice + sheetPrice, userID, reservedAt.Format("2006-01-02T15:04:05.000000Z"), canceledAtStr)
-				body = append(body, rowStr...)
-				rr.lastID = reservationID
 			}
-			if flag {
-				continue
-			}
-			c.Response().Header().Set("Content-Type", `text/csv; charset=UTF-8`)
-			c.Response().Header().Set("Content-Disposition", `attachment; filename="report.csv"`)
-			_, err := c.Response().Write(body)
-			rr.outChan <- err
 		}
 	}()
 	return rr
