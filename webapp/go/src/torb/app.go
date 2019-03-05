@@ -785,7 +785,7 @@ func main() {
 		c.Bind(&params)
 
 		user := new(User)
-		if err := db.QueryRow("SELECT id, nickname, pass_hash FROM users WHERE login_name = ?", params.LoginName).Scan(&user.ID, &user.Nickname, &user.LoginName, &user.PassHash); err != nil {
+		if err := db.QueryRow("SELECT id, nickname, pass_hash FROM users WHERE login_name = ?", params.LoginName).Scan(&user.ID, &user.Nickname, &user.PassHash); err != nil {
 			if err == sql.ErrNoRows {
 				return resError(c, "authentication_failed", 401)
 			}
