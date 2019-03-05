@@ -11,7 +11,6 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"sort"
 	"strconv"
 	"time"
 	"net/http"
@@ -25,6 +24,8 @@ import (
 
 	"sync"
 	"math/rand"
+	"crypto/sha256"
+	"encoding/hex"
 )
 
 type User struct {
@@ -784,18 +785,15 @@ func main() {
 		c.Bind(&params)
 
 		user := new(User)
-		if err := db.QueryRow("SELECT * FROM users WHERE login_name = ?", params.LoginName).Scan(&user.ID, &user.Nickname, &user.LoginName, &user.PassHash); err != nil {
+		if err := db.QueryRow("SELECT id, nickname, pass_hash FROM users WHERE login_name = ?", params.LoginName).Scan(&user.ID, &user.Nickname, &user.LoginName, &user.PassHash); err != nil {
 			if err == sql.ErrNoRows {
 				return resError(c, "authentication_failed", 401)
 			}
 			return err
 		}
 
-		var passHash string
-		if err := db.QueryRow("SELECT SHA2(?, 256)", params.Password).Scan(&passHash); err != nil {
-			return err
-		}
-		if user.PassHash != passHash {
+		passHash := sha256.Sum256([]byte(params.Password))
+		if user.PassHash != hex.EncodeToString(passHash[:]) {
 			return resError(c, "authentication_failed", 401)
 		}
 
@@ -1021,11 +1019,8 @@ func main() {
 			return err
 		}
 
-		var passHash string
-		if err := db.QueryRow("SELECT SHA2(?, 256)", params.Password).Scan(&passHash); err != nil {
-			return err
-		}
-		if administrator.PassHash != passHash {
+		passHash := sha256.Sum256([]byte(params.Password))
+		if administrator.PassHash != hex.EncodeToString(passHash[:]) {
 			return resError(c, "authentication_failed", 401)
 		}
 
@@ -1161,7 +1156,7 @@ func main() {
 			return resError(c, "not_found", 404)
 		}
 
-		rows, err := db.Query("SELECT r.id, r.user_id, r.reserved_at, r.canceled_at, s.rank, s.num, s.price, e.price FROM (reservations AS r INNER JOIN events AS e ON r.event_id = e.id AND e.id = ?) INNER JOIN sheets AS s ON r.sheet_id = s.id", eventID)
+		rows, err := db.Query("SELECT r.id, r.user_id, r.reserved_at, r.canceled_at, s.rank, s.num, s.price, e.price FROM (reservations AS r INNER JOIN events AS e ON r.event_id = e.id AND e.id = ?) INNER JOIN sheets AS s ON r.sheet_id = s.id ORDER BY r.id", eventID)
 		if err != nil {
 			return err
 		}
@@ -1198,7 +1193,7 @@ func main() {
 		return renderReportCSV(c, reports)
 	}, adminLoginRequired)
 	e.GET("/admin/api/reports/sales", func(c echo.Context) error {
-		rows, err := db.Query("select r.id, r.user_id, r.reserved_at, r.canceled_at, s.rank, s.num, s.price, e.id, e.price from reservations r inner join sheets s on s.id = r.sheet_id inner join events e on e.id = r.event_id")
+		rows, err := db.Query("select STRAIGHT_JOIN r.id, r.user_id, r.reserved_at, r.canceled_at, s.rank, s.num, s.price, e.id, e.price from reservations r inner join sheets s on s.id = r.sheet_id inner join events e on e.id = r.event_id ORDER BY r.id")
 		if err != nil {
 			return err
 		}
@@ -1249,8 +1244,6 @@ type Report struct {
 }
 
 func renderReportCSV(c echo.Context, reports []*Report) error {
-	sort.Slice(reports, func(i, j int) bool { return reports[i].SoldAt.Before(*reports[j].SoldAt) })
-
 	body := bytes.NewBufferString("reservation_id,event_id,rank,num,price,user_id,sold_at,canceled_at\n")
 	for _, v := range reports {
 		var canceledAt string
