@@ -26,6 +26,7 @@ import (
 	"math/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"sort"
 )
 
 type User struct {
@@ -674,9 +675,8 @@ func main() {
 		})
 	})
 	e.GET("/api/users/:id", func(c echo.Context) error {
-		// ユーザIDとユーザ名を取得し、userという変数に格納
-		var user User
-		if err := db.QueryRow("SELECT id, nickname FROM users WHERE id = ?", c.Param("id")).Scan(&user.ID, &user.Nickname); err != nil {
+		userID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+		if err != nil {
 			return err
 		}
 
@@ -684,11 +684,11 @@ func main() {
 		if err != nil {
 			return err
 		}
-		if user.ID != loginUser.ID {
+		if userID != loginUser.ID {
 			return resError(c, "forbidden", 403)
 		}
 		// 先に、直近に予約・キャンセルした予約一覧を取得
-		rows, err := db.Query("SELECT e.* FROM events AS e INNER JOIN reservations AS r ON r.user_id = ? AND e.id = r.event_id GROUP BY event_id ORDER BY MAX(IFNULL(canceled_at, reserved_at)) DESC LIMIT 5", user.ID)
+		rows, err := db.Query("SELECT e.* FROM events AS e INNER JOIN reservations AS r ON r.user_id = ? AND e.id = r.event_id GROUP BY event_id ORDER BY MAX(IFNULL(canceled_at, reserved_at)) DESC LIMIT 5", userID)
 		if err != nil {
 			return err
 		}
@@ -744,7 +744,7 @@ func main() {
 		// recentEvents 取得完了
 
 		// キャンセル日時、または予約日時が新しい順に最大五件の予約情報を取得する
-		rows, err = db.Query("SELECT r.id, r.event_id, r.sheet_id, r.user_id, r.reserved_at, r.canceled_at, s.rank, s.num FROM reservations r INNER JOIN sheets s ON s.id = r.sheet_id WHERE r.user_id = ? ORDER BY IFNULL(r.canceled_at, r.reserved_at) DESC LIMIT 5", user.ID)
+		rows, err = db.Query("SELECT r.id, r.event_id, r.sheet_id, r.user_id, r.reserved_at, r.canceled_at, s.rank, s.num FROM reservations r INNER JOIN sheets s ON s.id = r.sheet_id WHERE r.user_id = ? ORDER BY IFNULL(r.canceled_at, r.reserved_at) DESC LIMIT 5", userID)
 		if err != nil {
 			return err
 		}
@@ -783,12 +783,12 @@ func main() {
 		
 		// 総額の計算
 		var totalPrice int
-		if err := db.QueryRow("SELECT IFNULL(SUM(e.price + s.price), 0) FROM reservations r INNER JOIN sheets s ON s.id = r.sheet_id INNER JOIN events e ON e.id = r.event_id WHERE r.user_id = ? AND NOT r.is_canceled", user.ID).Scan(&totalPrice); err != nil {
+		if err := db.QueryRow("SELECT IFNULL(SUM(e.price + s.price), 0) FROM reservations r INNER JOIN sheets s ON s.id = r.sheet_id INNER JOIN events e ON e.id = r.event_id WHERE r.user_id = ? AND NOT r.is_canceled", userID).Scan(&totalPrice); err != nil {
 			return err
 		}
 		return c.JSON(200, echo.Map{
-			"id":                  user.ID,
-			"nickname":            user.Nickname,
+			"id":                  userID,
+			"nickname":            loginUser.Nickname,
 			"recent_reservations": recentReservations,
 			"total_price":         totalPrice,
 			"recent_events":       recentEvents,
@@ -951,34 +951,21 @@ func main() {
 		} else {
 			return resError(c, "invalid_event", 404)
 		}
+		for _, s := range ec.event.Sheets[rank].Detail {
+			if s.Num == num {
+				if s.User != user.ID {
+					return resError(c, "not_permitted", 403)
+				}
+				break
+			}
+		}
 
 		sheetID := sheetNumToID(num, rankNum)
 
-		tx, err := db.Begin()
-		if err != nil {
-			return err
-		}
-
-		var reservationID int64
-		var userID int64
-		if err := tx.QueryRow("SELECT id, user_id FROM reservations WHERE event_id = ? AND sheet_id = ? AND NOT is_canceled FOR UPDATE", eventID, sheetID).Scan(&reservationID, &userID); err != nil {
-			tx.Rollback()
+		if _, err := db.Exec("UPDATE reservations SET canceled_at = ?, is_canceled = TRUE WHERE event_id = ? AND sheet_id = ? AND NOT is_canceled", time.Now().UTC().Format("2006-01-02 15:04:05.000000"), eventID, sheetID); err != nil {
 			if err == sql.ErrNoRows {
 				return resError(c, "not_reserved", 400)
 			}
-			return err
-		}
-		if userID != user.ID {
-			tx.Rollback()
-			return resError(c, "not_permitted", 403)
-		}
-
-		if _, err := tx.Exec("UPDATE reservations SET canceled_at = ?, is_canceled = TRUE WHERE id = ?", time.Now().UTC().Format("2006-01-02 15:04:05.000000"), reservationID); err != nil {
-			tx.Rollback()
-			return err
-		}
-
-		if err := tx.Commit(); err != nil {
 			return err
 		}
 		// 予約可能にする
@@ -1169,8 +1156,7 @@ func main() {
 		if err != nil {
 			return resError(c, "not_found", 404)
 		}
-
-		rows, err := db.Query("SELECT r.id, r.user_id, r.reserved_at, r.canceled_at, s.rank, s.num, s.price, e.price FROM (reservations AS r INNER JOIN events AS e ON r.event_id = e.id AND e.id = ?) INNER JOIN sheets AS s ON r.sheet_id = s.id ORDER BY r.id", eventID)
+		rows, err := db.Query("SELECT r.id, r.user_id, r.reserved_at, r.canceled_at, s.rank, s.num, s.price, e.price FROM (reservations AS r INNER JOIN events AS e ON r.event_id = e.id AND e.id = ?) INNER JOIN sheets AS s ON r.sheet_id = s.id", eventID)
 		if err != nil {
 			return err
 		}
@@ -1207,7 +1193,7 @@ func main() {
 		return renderReportCSV(c, reports)
 	}, adminLoginRequired)
 	e.GET("/admin/api/reports/sales", func(c echo.Context) error {
-		rows, err := db.Query("select STRAIGHT_JOIN r.id, r.user_id, r.reserved_at, r.canceled_at, s.rank, s.num, s.price, e.id, e.price from reservations r inner join sheets s on s.id = r.sheet_id inner join events e on e.id = r.event_id ORDER BY r.id")
+		rows, err := db.Query("select r.id, r.user_id, r.reserved_at, r.canceled_at, s.rank, s.num, s.price, e.id, e.price from reservations r inner join sheets s on s.id = r.sheet_id inner join events e on e.id = r.event_id")
 		if err != nil {
 			return err
 		}
@@ -1258,6 +1244,8 @@ type Report struct {
 }
 
 func renderReportCSV(c echo.Context, reports []*Report) error {
+	sort.Slice(reports, func(i, j int) bool { return reports[i].SoldAt.Before(*reports[j].SoldAt) })
+
 	body := bytes.NewBufferString("reservation_id,event_id,rank,num,price,user_id,sold_at,canceled_at\n")
 	for _, v := range reports {
 		var canceledAt string
