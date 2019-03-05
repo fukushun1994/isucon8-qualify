@@ -25,6 +25,8 @@ import (
 
 	"sync"
 	"math/rand"
+	"crypto/sha256"
+	"encoding/hex"
 )
 
 type User struct {
@@ -800,18 +802,22 @@ func main() {
 		c.Bind(&params)
 
 		user := new(User)
-		if err := db.QueryRow("SELECT * FROM users WHERE login_name = ?", params.LoginName).Scan(&user.ID, &user.Nickname, &user.LoginName, &user.PassHash); err != nil {
+		if err := db.QueryRow("SELECT id, nickname, pass_hash FROM users WHERE login_name = ?", params.LoginName).Scan(&user.ID, &user.Nickname, &user.PassHash); err != nil {
 			if err == sql.ErrNoRows {
 				return resError(c, "authentication_failed", 401)
 			}
 			return err
 		}
-
+		/*
 		var passHash string
 		if err := db.QueryRow("SELECT SHA2(?, 256)", params.Password).Scan(&passHash); err != nil {
 			return err
 		}
 		if user.PassHash != passHash {
+			return resError(c, "authentication_failed", 401)
+		}*/
+		passHash := sha256.Sum256([]byte(params.Password))
+		if user.PassHash != hex.EncodeToString(passHash[:]) {
 			return resError(c, "authentication_failed", 401)
 		}
 
@@ -1036,12 +1042,16 @@ func main() {
 			}
 			return err
 		}
-
+		/*
 		var passHash string
 		if err := db.QueryRow("SELECT SHA2(?, 256)", params.Password).Scan(&passHash); err != nil {
 			return err
 		}
 		if administrator.PassHash != passHash {
+			return resError(c, "authentication_failed", 401)
+		}*/
+		passHash := sha256.Sum256([]byte(params.Password))
+		if administrator.PassHash != hex.EncodeToString(passHash[:]) {
 			return resError(c, "authentication_failed", 401)
 		}
 
