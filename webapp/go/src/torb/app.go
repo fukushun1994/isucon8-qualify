@@ -584,9 +584,21 @@ func initializeReport() {
 	sort.Slice(reportRenderer.reports, func(i, j int) bool { return reportRenderer.reports[i].SoldAt.Before(*reportRenderer.reports[j].SoldAt) })
 }
 
+func initializeUsers() {
+	rows, _ := db.Query("SELECT * FROM users")
+	defer rows.Close()
+	for rows.Next() {
+		var user User
+		rows.Scan(&user.ID, &user.Nickname, &user.LoginName, &user.PassHash)
+		usersMap[user.LoginName] = &user
+	}
+}
+
 var eventCache []*EventCache
 var sheetInfo SheetInfo
 var reportRenderer *ReportRenderer
+
+var usersMap map[string]*User
 
 func main() {
 	go func() {
@@ -613,6 +625,9 @@ func main() {
 
 	// 予約可能な座席情報を取得する
 	setAvailableSheetsFromDB()
+
+	usersMap = make(map[string]*User)
+	initializeUsers()
 
 	// レポートの初期化
 	reportRenderer = NewReportRenderer()
@@ -671,16 +686,14 @@ func main() {
 			return err
 		}
 
-		var user User
-		if err := tx.QueryRow("SELECT * FROM users WHERE login_name = ?", params.LoginName).Scan(&user.ID, &user.LoginName, &user.Nickname, &user.PassHash); err != sql.ErrNoRows {
-			tx.Rollback()
-			if err == nil {
-				return resError(c, "duplicated", 409)
-			}
-			return err
+		_, found := usersMap[params.LoginName]
+		if found {
+			return resError(c, "duplicated", 409)
 		}
 
-		res, err := tx.Exec("INSERT INTO users (login_name, pass_hash, nickname) VALUES (?, SHA2(?, 256), ?)", params.LoginName, params.Password, params.Nickname)
+		passHash := sha256.Sum256([]byte(params.Password))
+		passHashStr := hex.EncodeToString(passHash[:])
+		res, err := tx.Exec("INSERT INTO users (login_name, pass_hash, nickname) VALUES (?, ?, ?)", params.LoginName, passHashStr, params.Nickname)
 		if err != nil {
 			tx.Rollback()
 			return resError(c, "", 0)
@@ -693,6 +706,7 @@ func main() {
 		if err := tx.Commit(); err != nil {
 			return err
 		}
+		usersMap[params.LoginName] = &User{ID: userID, Nickname: params.Nickname, LoginName: params.LoginName, PassHash: passHashStr}
 
 		return c.JSON(201, echo.Map{
 			"id":       userID,
@@ -827,12 +841,9 @@ func main() {
 		}
 		c.Bind(&params)
 
-		user := new(User)
-		if err := db.QueryRow("SELECT id, nickname, pass_hash FROM users WHERE login_name = ?", params.LoginName).Scan(&user.ID, &user.Nickname, &user.PassHash); err != nil {
-			if err == sql.ErrNoRows {
-				return resError(c, "authentication_failed", 401)
-			}
-			return err
+		user, ok := usersMap[params.LoginName]
+		if !ok {
+			return resError(c, "authentication_failed", 401)
 		}
 		/*
 		var passHash string
