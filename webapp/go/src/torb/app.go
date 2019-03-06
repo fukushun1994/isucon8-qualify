@@ -27,6 +27,9 @@ import (
 	"github.com/labstack/echo"
 	"github.com/labstack/echo-contrib/session"
 	"github.com/labstack/echo/middleware"
+
+	"net/http"
+	_ "net/http/pprof"
 )
 
 type User struct {
