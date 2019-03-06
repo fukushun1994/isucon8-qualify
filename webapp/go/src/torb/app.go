@@ -1037,7 +1037,9 @@ func main() {
 			tx.Rollback()
 			return err
 		}
-		reservationCanceledAt[reservationID] = &canceledAt
+		go func(){
+			reservationCanceledAt[reservationID] = &canceledAt
+		}()
 
 		if err := tx.Commit(); err != nil {
 			return err
@@ -1370,7 +1372,6 @@ type ReportRenderer struct {
 	reportChan chan *Report
 	lastTime *time.Time
 	reports []*Report
-	reportsByEvent[][]*Report
 }
 
 type ReportRequest struct {
@@ -1389,21 +1390,25 @@ func NewReportRenderer() *ReportRenderer {
 	rr.lastTime = new(time.Time)
 	go func() {
 		for true {
-			select {
-			case req := <- rr.inChan:
-				rr.outChan <- renderReportCSV(req.context, rr.reports, req.eventID)
-			case r := <- rr.reportChan:
-				var flag bool
-				for i := len(rr.reports)-1; i >= 0; i-- {
-					if r.SoldAt.After(*rr.reports[i].SoldAt) {
-						rr.reports = append(rr.reports[:i+1], append([]*Report{r}, rr.reports[i+1:]...)...)
-						flag = true
-						break
-					}
+			req := <- rr.inChan
+			buffer := make([]*Report, len(rr.reports))
+			copy(buffer, rr.reports)
+			rr.outChan <- renderReportCSV(req.context, buffer, req.eventID)
+		}
+	}()
+	go func() {
+		for true {
+			r := <- rr.reportChan
+			var flag bool
+			for i := len(rr.reports)-1; i >= 0; i-- {
+				if r.SoldAt.After(*rr.reports[i].SoldAt) {
+					rr.reports = append(rr.reports[:i+1], append([]*Report{r}, rr.reports[i+1:]...)...)
+					flag = true
+					break
 				}
-				if !flag {
-					rr.reports = append([]*Report{r}, rr.reports...)
-				}
+			}
+			if !flag {
+				rr.reports = append([]*Report{r}, rr.reports...)
 			}
 		}
 	}()
