@@ -232,44 +232,52 @@ func getEvents(all bool) ([]*Event, error) {
 
 func getEvent(eventID, loginUserID int64) (*Event, error) {
 	var event Event
+	if err := db.QueryRow("SELECT * FROM events WHERE id = ?", eventID).Scan(&event.ID, &event.Title, &event.PublicFg, &event.ClosedFg, &event.Price); err != nil {
+		return nil, err
+	}
 	event.Sheets = map[string]*Sheets{
 		"S": &Sheets{},
 		"A": &Sheets{},
 		"B": &Sheets{},
 		"C": &Sheets{},
 	}
-
-	if err := db.QueryRow("SELECT * FROM events WHERE id = ?", eventID).Scan(&event.ID, &event.Title, &event.PublicFg, &event.ClosedFg, &event.Price); err != nil {
-		return nil, err
+	for rank, s := range event.Sheets {
+		s.Price = sheetStat.Price[rank] + event.Price
+		s.Total = sheetStat.TotalByRank[rank]
+		event.Total += sheetStat.TotalByRank[rank]
+		s.Remains = s.Total
+		event.Remains = event.Total
 	}
-
-	rows, err := db.Query("SELECT s.id, s.rank, s.num, s.price, r.user_id, r.reserved_at FROM sheets AS s LEFT OUTER JOIN reservations AS r ON s.id = r.sheet_id AND r.event_id = ? AND r.canceled_at IS NULL", eventID)
+	for _, s := range sheets {
+		var sheet Sheet
+		sheet.Rank = s.Rank
+		sheet.Num = s.Num
+		sheet.Price = s.Price
+		event.Sheets[s.Rank].Detail = append(event.Sheets[s.Rank].Detail, &sheet)
+	}
+	
+	rows, err := db.Query("SELECT r.sheet_id, r.user_id, r.reserved_at FROM reservations AS r WHERE r.event_id = ? AND r.canceled_at IS NULL", eventID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	
 	for rows.Next() {
-		var sheet Sheet
-		var userID sql.NullInt64
+		var sheetID int64
+		var userID int64
 		var reservedAt *time.Time
 
-		if err := rows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price, &userID, &reservedAt); err != nil {
+		if err := rows.Scan(&sheetID, &userID, &reservedAt); err != nil {
 			return nil, err
 		}
-		event.Sheets[sheet.Rank].Price = event.Price + sheet.Price
-		event.Total++
-		event.Sheets[sheet.Rank].Total++
-
-		if userID.Valid {
-			sheet.Mine = userID.Int64 == loginUserID
-			sheet.Reserved = true
-			sheet.ReservedAtUnix = reservedAt.Unix()
-		} else {
-			event.Remains++
-			event.Sheets[sheet.Rank].Remains++
-		}
-		event.Sheets[sheet.Rank].Detail = append(event.Sheets[sheet.Rank].Detail, &sheet)
+		rank := getRankFromID(sheetID)
+		num := getNumFromID(sheetID)
+		sheet := event.Sheets[rank].Detail[num-1]
+		sheet.Reserved = true
+		sheet.ReservedAtUnix = reservedAt.Unix()
+		sheet.Mine = userID == loginUserID
+		event.Remains--
+		event.Sheets[rank].Remains--
 	}
 
 	return &event, nil
@@ -317,6 +325,59 @@ func (r *Renderer) Render(w io.Writer, name string, data interface{}, c echo.Con
 
 var db *sql.DB
 
+type SimpleSheet struct {
+	ID    int64
+	Rank  string
+	Num   int64
+	Price int64
+}
+type SheetStat struct {
+	Total int
+	TotalByRank map[string]int
+	Price map[string]int64
+}
+func getRankFromID(sheetID int64)string {
+	if sheetID >= 501 {
+		return "C"
+	} else if sheetID >= 201 {
+		return "B"
+	} else if sheetID >= 51 {
+		return "A"
+	} else {
+		return "S"
+	}
+}
+func getNumFromID(sheetID int64)int64 {
+	if sheetID >= 501 {
+		return sheetID - 500
+	} else if sheetID >= 201 {
+		return sheetID - 200
+	} else if sheetID >= 51 {
+		return sheetID - 50
+	} else {
+		return sheetID
+	}
+}
+var sheets []*SimpleSheet
+var sheetStat *SheetStat
+
+func loadSheets() {
+	sheets = make([]*SimpleSheet, 0)
+	sheetStat = new(SheetStat)
+	sheetStat.TotalByRank = map[string]int{"S": 0, "A": 0, "B": 0, "C": 0}
+	sheetStat.Price = make(map[string]int64)
+	rows, _ := db.Query("SELECT * FROM sheets ORDER BY id")
+	defer rows.Close()
+	for rows.Next() {
+		var s SimpleSheet
+		rows.Scan(&s.ID, &s.Rank, &s.Num, &s.Price)
+		sheets = append(sheets, &s)
+		sheetStat.Total++
+		sheetStat.TotalByRank[s.Rank]++
+		sheetStat.Price[s.Rank] = s.Price
+	}
+}
+
 func main() {
 	go func() {
 		log.Println(http.ListenAndServe("localhost:6060", nil))
@@ -333,6 +394,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	// 座席情報の取得
+	loadSheets()
 
 	e := echo.New()
 	funcs := template.FuncMap{
